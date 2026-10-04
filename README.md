@@ -14,7 +14,9 @@ It combines:
 
 Prebuilt releases are available here:
 
-- [Download HuggingBox](https://github.com/Schwaemo/huggingbox/releases)
+- [Download HuggingBox (latest release)](https://github.com/tng4480/huggingbox/releases/latest)
+
+The latest version is [v0.1.1](https://github.com/tng4480/huggingbox/releases/tag/v0.1.1), with a Windows installer (`.exe`) and an `.msi` package.
 
 If there is no release yet for your platform, build it locally using the instructions below.
 

@@ -129,6 +129,8 @@ interface AppStore {
   modelDetail: HFModelDetail | null;
   modelDetailLoading: boolean;
   modelDetailError: string | null;
+  /** GGUF file (quantization) chosen on the detail page; null = auto-pick. */
+  selectedGguf: string | null;
   generatedCode: string | null;
   codeGenerating: boolean;
   codeSource: 'generated' | 'cached' | 'edited' | null;
@@ -180,6 +182,7 @@ interface AppStore {
   setModelDetail: (detail: HFModelDetail | null) => void;
   setModelDetailLoading: (loading: boolean) => void;
   setModelDetailError: (err: string | null) => void;
+  setSelectedGguf: (file: string | null) => void;
   setGeneratedCode: (code: string | null) => void;
   setCodeGenerating: (gen: boolean) => void;
   setCodeSource: (src: AppStore['codeSource']) => void;
@@ -228,6 +231,7 @@ export const useAppStore = create<AppStore>((set) => ({
   modelDetail: null,
   modelDetailLoading: false,
   modelDetailError: null,
+  selectedGguf: null,
   generatedCode: null,
   codeGenerating: false,
   codeSource: null,
@@ -297,6 +301,7 @@ export const useAppStore = create<AppStore>((set) => ({
         currentView: 'model-detail',
         modelDetail: null,
         modelDetailError: null,
+        selectedGguf: null,
         generatedCode: null,
         codeSource: null,
         executionState: 'idle',
@@ -346,6 +351,7 @@ export const useAppStore = create<AppStore>((set) => ({
   setModelDetail: (detail) => set({ modelDetail: detail }),
   setModelDetailLoading: (loading) => set({ modelDetailLoading: loading }),
   setModelDetailError: (err) => set({ modelDetailError: err }),
+  setSelectedGguf: (file) => set({ selectedGguf: file }),
   setGeneratedCode: (code) => set({ generatedCode: code }),
   setCodeGenerating: (gen) => set({ codeGenerating: gen }),
   setCodeSource: (src) => set({ codeSource: src }),

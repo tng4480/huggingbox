@@ -69,13 +69,13 @@ class DependencyManager:
         # ── llama_cpp: vendor-specific wheel ──────────────────────────────────
         if self.runtime == "llama_cpp":
             self._install_llama_cpp()
-            self._run_pip(["huggingface_hub", "hf_transfer"])
+            self._run_pip(["huggingface_hub"])
             return
 
         # ── diffusers on AMD/Intel: use stable-diffusion-cpp-python (Vulkan) ─
         if self.runtime == "diffusers" and self.gpu_backend in ("amd", "intel"):
             self._install_sd_cpp()
-            self._run_pip(["huggingface_hub", "pillow", "hf_transfer"])
+            self._run_pip(["huggingface_hub", "pillow"])
             return
 
         deps = self.get_dependencies()
@@ -107,7 +107,6 @@ class DependencyManager:
                 normalized.append(HF_TRANSFORMERS_GIT_URL)
             else:
                 normalized.append(dep)
-        normalized.append("hf_transfer")
         self._run_pip(normalized)
 
     # ── Private helpers ───────────────────────────────────────────────────────

@@ -25,9 +25,20 @@ def _pick_gguf(filenames: List[Any], vram_bytes: int) -> Optional[str]:
       - If vram_bytes == 0 (unknown), try the default quant, then any GGUF.
       - If no quant substring matches, return the lexicographically smallest .gguf.
     """
-    gguf_files = [f for f in filenames if isinstance(f, str) and f.lower().endswith(".gguf")]
+    gguf_files = [
+        f for f in filenames
+        if isinstance(f, str)
+        and f.lower().endswith(".gguf")
+        and "mmproj" not in f.lower()
+        and "imatrix" not in f.lower()
+    ]
     if not gguf_files:
         return None
+
+    # Explicit user choice from the UI (quantization picker) always wins.
+    requested = os.environ.get("HB_GGUF_FILE", "").strip()
+    if requested and requested in gguf_files:
+        return requested
 
     effective_vram = vram_bytes
     if effective_vram == 0:

@@ -520,7 +520,7 @@ export function useExecution() {
       try {
         appendLog(`Checking download readiness in ${options.storagePath}`);
         const missingDownloadDeps = await invoke<string[]>('check_packages', {
-          packages: ['huggingface_hub', 'hf_transfer'],
+          packages: ['huggingface_hub'],
           modelId: options.modelId,
           venvModelId: executionEnvModelId,
         });

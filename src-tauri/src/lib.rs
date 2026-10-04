@@ -1130,7 +1130,12 @@ async fn detect_python(app: AppHandle) -> PythonInfo {
 }
 
 #[tauri::command]
-async fn generate_python_code_local(app: AppHandle, model_id: String, hf_token: Option<String>) -> Result<String, String> {
+async fn generate_python_code_local(
+    app: AppHandle,
+    model_id: String,
+    hf_token: Option<String>,
+    gguf_file: Option<String>,
+) -> Result<String, String> {
     let python = find_python(&app).await?;
     let mut cmd = tokio::process::Command::new(&python);
     apply_no_window_tokio(&mut cmd);
@@ -1156,6 +1161,13 @@ async fn generate_python_code_local(app: AppHandle, model_id: String, hf_token: 
         .unwrap_or(0u64);
     cmd.env("HB_GPU_BACKEND", &gpu_backend_generate);
     cmd.env("HB_GPU_VRAM_BYTES", gpu_vram_bytes_generate.to_string());
+    // Quantization chosen in the UI; the Python generator uses it instead of auto-picking.
+    if let Some(ref file) = gguf_file {
+        let trimmed = file.trim();
+        if !trimmed.is_empty() {
+            cmd.env("HB_GGUF_FILE", trimmed);
+        }
+    }
     let mut args = vec!["-m".to_string(), "hf_auto_runner".to_string(), "generate".to_string(), model_id.clone()];
     if let Some(ref token) = hf_token {
         if !token.is_empty() {
@@ -1782,8 +1794,7 @@ import sys
 import time
 import json
 
-# Force Hugging Face Hub to use hf_transfer backend when available.
-os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
 
 from huggingface_hub import HfApi, hf_hub_download
 
@@ -1792,10 +1803,10 @@ target_dir = sys.argv[2]
 token = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
 
 try:
-    import hf_transfer  # noqa: F401
-    print("[HuggingBox] HF Transfer enabled.", flush=True)
+    import hf_xet  # noqa: F401
+    print("[HuggingBox] Xet high-performance downloads enabled.", flush=True)
 except Exception:
-    print("[HuggingBox] HF Transfer module missing; falling back to standard downloader.", flush=True)
+    print("[HuggingBox] hf_xet not installed; using standard downloader.", flush=True)
 
 api = HfApi(token=token)
 info = api.model_info(model_id)

@@ -7,6 +7,7 @@ import {
   estimateModelSize,
   formatBytes,
   formatDownloads,
+  isModelSizeEstimated,
 } from '../../services/huggingfaceApi';
 import { getCompatibility } from '../../utils/ramEstimation';
 
@@ -26,6 +27,7 @@ function ModelCard({ model }: ModelCardProps) {
   const totalRam = useAppStore((s) => s.systemInfo.totalRam);
 
   const sizeBytes = estimateModelSize(model);
+  const sizeEstimated = isModelSizeEstimated(model);
   const compat = getCompatibility(model, totalRam);
   const compatInfo = COMPAT_CONFIG[compat];
 
@@ -161,6 +163,7 @@ function ModelCard({ model }: ModelCardProps) {
                 color: 'var(--text-muted)',
               }}
             >
+              {sizeEstimated ? '~' : ''}
               {formatBytes(sizeBytes)}
             </span>
           </>

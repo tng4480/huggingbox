@@ -9,6 +9,8 @@ import {
   formatBytes,
   formatDownloads,
   getModelFormatInfo,
+  getGgufFiles,
+  resolveGgufFile,
 } from '../../services/huggingfaceApi';
 import { estimateRamBytes, getCompatibility } from '../../utils/ramEstimation';
 
@@ -35,9 +37,14 @@ export default function ModelInfoPanel({
   const [descExpanded, setDescExpanded] = useState(false);
   const totalRam = useAppStore((s) => s.systemInfo.totalRam);
 
-  const sizeBytes = estimateModelSize(model);
-  const ramEstBytes = estimateRamBytes(model);
-  const compat = getCompatibility(model, totalRam);
+  const selectedGguf = useAppStore((s) => s.selectedGguf);
+  const setSelectedGguf = useAppStore((s) => s.setSelectedGguf);
+  const ggufFiles = getGgufFiles(model);
+  const activeGguf = resolveGgufFile(model, selectedGguf);
+
+  const sizeBytes = estimateModelSize(model, selectedGguf);
+  const ramEstBytes = estimateRamBytes(model, selectedGguf);
+  const compat = getCompatibility(model, totalRam, selectedGguf);
   const compatInfo = COMPAT_CONFIG[compat];
 
   const [org, ...nameParts] = (model.modelId ?? model.id).split('/');
@@ -179,6 +186,39 @@ export default function ModelInfoPanel({
           </div>
         ))}
       </div>
+
+      {/* Quantization picker (GGUF repos ship many alternative quantizations of one model) */}
+      {ggufFiles.length > 1 && activeGguf && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <label htmlFor="gguf-select" style={metaLabelStyle}>
+            Quantization ({ggufFiles.length} files)
+          </label>
+          <select
+            id="gguf-select"
+            value={activeGguf.name}
+            onChange={(e) => setSelectedGguf(e.target.value)}
+            style={{
+              ...metaStyle,
+              backgroundColor: 'var(--bg-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: '6px',
+              padding: '8px 10px',
+              width: '100%',
+            }}
+          >
+            {ggufFiles.map((f) => (
+              <option key={f.name} value={f.name}>
+                {f.quant}
+                {f.size > 0 ? ` — ${formatBytes(f.size)}` : ''}
+                {` — ${f.name}`}
+              </option>
+            ))}
+          </select>
+          <div style={{ fontFamily: '"Inter", sans-serif', fontSize: '12px', color: 'var(--text-muted)' }}>
+            Size and RAM estimate are for the selected file only. This file is the one that will be downloaded and run.
+          </div>
+        </div>
+      )}
 
       {/* Compatibility indicator */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>

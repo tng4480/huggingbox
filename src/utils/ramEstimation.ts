@@ -1,5 +1,5 @@
 import type { HFModel } from '../stores/appStore';
-import { estimateModelSize } from '../services/huggingfaceApi';
+import { estimateModelSize, GGUF_RAM_MULTIPLIER, hasGgufFiles } from '../services/huggingfaceApi';
 
 // RAM multipliers per pipeline type
 const RAM_MULTIPLIERS: Record<string, number> = {
@@ -26,13 +26,19 @@ const RAM_MULTIPLIERS: Record<string, number> = {
 
 const DIFFUSION_FLAT_GB = 8 * 1024 ** 3; // 8 GB flat for diffusion models
 
-export function estimateRamBytes(model: HFModel): number {
+export function estimateRamBytes(model: HFModel, selectedGguf?: string | null): number {
   const tag = model.pipeline_tag ?? '';
-  const sizeBytes = estimateModelSize(model);
+  const sizeBytes = estimateModelSize(model, selectedGguf);
 
   // Diffusion models: flat estimate
   if (tag === 'text-to-image' || tag === 'image-to-image') {
     return DIFFUSION_FLAT_GB;
+  }
+
+  // GGUF weights are memory-mapped at roughly their file size plus a small
+  // runtime overhead; the fp16/transformers multipliers below do not apply.
+  if (hasGgufFiles(model)) {
+    return sizeBytes * GGUF_RAM_MULTIPLIER;
   }
 
   const multiplier = RAM_MULTIPLIERS[tag] ?? 2.0;
@@ -43,10 +49,11 @@ export type CompatibilityLevel = 'compatible' | 'tight' | 'too-large' | 'unknown
 
 export function getCompatibility(
   model: HFModel,
-  totalRamBytes: number
+  totalRamBytes: number,
+  selectedGguf?: string | null
 ): CompatibilityLevel {
   if (totalRamBytes === 0) return 'unknown';
-  const ramEst = estimateRamBytes(model);
+  const ramEst = estimateRamBytes(model, selectedGguf);
   if (ramEst === 0) return 'unknown';
   const ratio = ramEst / totalRamBytes;
   if (ratio < 0.6) return 'compatible';

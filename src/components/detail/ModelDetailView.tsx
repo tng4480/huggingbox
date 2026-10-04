@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../stores/appStore';
 import type { HFModelDetail } from '../../stores/appStore';
 import { confirmDialog, messageDialog } from '../../services/dialogs';
-import { fetchModelDetail, estimateModelSize, formatBytes, getModelFormatInfo } from '../../services/huggingfaceApi';
+import { fetchModelDetail, estimateModelSize, formatBytes, getModelFormatInfo, resolveGgufFile } from '../../services/huggingfaceApi';
 import { estimateRamBytes } from '../../utils/ramEstimation';
 import {
   buildCacheIdentity,
@@ -102,7 +102,10 @@ export default function ModelDetailView() {
     setCodeGenerating(true);
 
     const modelId = modelDetail.modelId ?? modelDetail.id;
-    const cacheIdentity = `${buildCacheIdentity(modelDetail, systemInfo)}_generator:${settings.codeGenerationProvider}`;
+    const ggufFile = resolveGgufFile(modelDetail, useAppStore.getState().selectedGguf)?.name ?? null;
+    const cacheIdentity = `${buildCacheIdentity(modelDetail, systemInfo)}_generator:${settings.codeGenerationProvider}${
+      ggufFile ? `_gguf:${ggufFile}` : ''
+    }`;
     const bypassCache = options?.bypassCache === true;
 
     try {
@@ -118,7 +121,7 @@ export default function ModelDetailView() {
           const usingClaude = settings.codeGenerationProvider === 'claude-sonnet';
           const generated = usingClaude
             ? await generateCodeWithClaude(modelDetail, settings, systemInfo)
-            : await generateCodeLocally(modelDetail, settings, systemInfo);
+            : await generateCodeLocally(modelDetail, settings, systemInfo, ggufFile);
           code = generated.code;
           setClaudeAnalysis(generated.analysis);
           setCodeSource('generated');
@@ -510,10 +513,11 @@ function WorkspaceLayout({
     executionState === 'downloading';
 
   // Derive metadata labels for InputPanel info section
-  const sizeBytes = estimateModelSize(model);
+  const selectedGguf = useAppStore((s) => s.selectedGguf);
+  const sizeBytes = estimateModelSize(model, selectedGguf);
   const sizeLabel = sizeBytes > 0 ? formatBytes(sizeBytes) : undefined;
 
-  const ramBytes = estimateRamBytes(model);
+  const ramBytes = estimateRamBytes(model, selectedGguf);
   const ramLabel = ramBytes > 0 ? `~${formatBytes(ramBytes)}` : undefined;
 
   const formatInfo = getModelFormatInfo(model);

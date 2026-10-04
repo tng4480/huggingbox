@@ -70,7 +70,7 @@ function normalizeDependencyName(raw: string): string {
   return raw.trim().toLowerCase().replace(/^['"`]+|['"`]+$/g, '');
 }
 
-function withHfTransfer(dependencies: string[]): string[] {
+function dedupeDependencies(dependencies: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
 
@@ -80,10 +80,6 @@ function withHfTransfer(dependencies: string[]): string[] {
     if (!trimmed || !key || seen.has(key)) continue;
     seen.add(key);
     out.push(trimmed);
-  }
-
-  if (!seen.has('hf_transfer')) {
-    out.push('hf_transfer');
   }
 
   return out;
@@ -110,7 +106,8 @@ export function buildCacheIdentity(model: HFModelDetail, system: SystemInfo): st
 export async function generateCodeLocally(
   model: HFModelDetail,
   settings: AppSettings,
-  _system: SystemInfo
+  _system: SystemInfo,
+  ggufFile?: string | null
 ): Promise<CodeGenerationResponse> {
   const modelId = model.modelId || model.id;
   
@@ -122,6 +119,7 @@ export async function generateCodeLocally(
   try {
     const rawResponse = await invoke<string>('generate_python_code_local', {
       modelId: modelId,
+      ggufFile: ggufFile ?? null,
       hfToken: settings.hfToken?.trim() ? settings.hfToken.trim() : null,
     });
     
@@ -263,7 +261,7 @@ export async function generateCodeWithClaude(
     return {
       code: parsed.code,
       analysis: parsed.analysis,
-      dependencies: withHfTransfer(
+      dependencies: dedupeDependencies(
         Array.isArray(parsed.dependencies)
           ? parsed.dependencies.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
           : []
@@ -369,7 +367,7 @@ export async function fixCodeWithClaude(
   return {
     code: parsed.code,
     analysis: parsed.analysis,
-    dependencies: withHfTransfer(
+    dependencies: dedupeDependencies(
       Array.isArray(parsed.dependencies)
         ? parsed.dependencies.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
         : []

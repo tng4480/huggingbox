@@ -74,31 +74,104 @@ export async function fetchModelDetail(
   return data;
 }
 
-// Estimate total model size in bytes from siblings list
-export function estimateModelSize(model: HFModel): number {
-  const fromSiblings = (model.siblings ?? []).reduce((acc, f) => {
-    const direct = typeof f.size === 'number' ? f.size : 0;
-    const lfs = typeof f.lfs?.size === 'number' ? f.lfs.size : 0;
-    return acc + (direct > 0 ? direct : lfs > 0 ? lfs : 0);
-  }, 0);
-  if (fromSiblings > 0) return fromSiblings;
+type Sibling = NonNullable<HFModel['siblings']>[number];
 
+function siblingSize(f: Sibling): number {
+  const direct = typeof f.size === 'number' ? f.size : 0;
+  const lfs = typeof f.lfs?.size === 'number' ? f.lfs.size : 0;
+  return direct > 0 ? direct : lfs > 0 ? lfs : 0;
+}
+
+// ─── GGUF (quantization) helpers ─────────────────────────────────────────────
+
+export interface GgufFileInfo {
+  name: string;
+  /** Size in bytes, or 0 when unknown (browse list API does not return sizes). */
+  size: number;
+  /** Quantization label parsed from the file name, e.g. "Q4_K_M". */
+  quant: string;
+}
+
+const QUANT_RE = /(IQ\d_[A-Z0-9]+|Q\d_K_[SML]|Q\d_K|Q\d_\d|BF16|F16|F32)/i;
+
+// Preferred default quantization, best balance of quality and size first.
+const DEFAULT_QUANT_ORDER = ['Q4_K_M', 'Q4_K_S', 'Q4_0', 'IQ4_XS', 'Q5_K_M', 'Q5_K_S', 'Q3_K_M', 'Q8_0'];
+
+// Typical GGUF runtime overhead on top of the file size (KV cache, buffers).
+export const GGUF_RAM_MULTIPLIER = 1.2;
+// ~Q4_K_M bytes per parameter, used only when real file sizes are unavailable.
+const GGUF_BYTES_PER_PARAM = 0.65;
+
+/** All loadable GGUF files in the repo, smallest first. Projector (mmproj) and imatrix calibration files are not models and are excluded. */
+export function getGgufFiles(model: HFModel): GgufFileInfo[] {
+  return (model.siblings ?? [])
+    .filter((f) => f.rfilename.toLowerCase().endsWith('.gguf') && !/mmproj|imatrix/i.test(f.rfilename))
+    .map((f) => ({
+      name: f.rfilename,
+      size: siblingSize(f),
+      quant: (f.rfilename.match(QUANT_RE)?.[1] ?? 'GGUF').toUpperCase(),
+    }))
+    .sort((a, b) => a.size - b.size || a.name.localeCompare(b.name));
+}
+
+/** The GGUF file that will be used: the user's pick if valid, otherwise a sensible default. */
+export function resolveGgufFile(model: HFModel, selected?: string | null): GgufFileInfo | null {
+  const files = getGgufFiles(model);
+  if (files.length === 0) return null;
+  const chosen = selected ? files.find((f) => f.name === selected) : undefined;
+  if (chosen) return chosen;
+  for (const quant of DEFAULT_QUANT_ORDER) {
+    const hit = files.find((f) => f.quant === quant);
+    if (hit) return hit;
+  }
+  return files[Math.floor(files.length / 2)];
+}
+
+export function hasGgufFiles(model: HFModel): boolean {
+  return getGgufFiles(model).length > 0;
+}
+
+/** True when the size is a name-based guess rather than real file sizes from Hugging Face. */
+export function isModelSizeEstimated(model: HFModel): boolean {
+  const ggufs = getGgufFiles(model);
+  if (ggufs.length > 0) return ggufs.every((f) => f.size === 0);
+  if ((model.siblings ?? []).some((f) => siblingSize(f) > 0)) return false;
   const safetensorsTotal = (model as HFModelDetail).safetensors?.total;
-  if (typeof safetensorsTotal === 'number' && safetensorsTotal > 0) {
-    return safetensorsTotal;
+  return !(typeof safetensorsTotal === 'number' && safetensorsTotal > 0);
+}
+
+/**
+ * Estimate the size in bytes of what will actually be loaded.
+ * GGUF repos hold many alternative quantizations of one model, so only the
+ * selected file counts, never the sum of all of them.
+ */
+export function estimateModelSize(model: HFModel, selectedGguf?: string | null): number {
+  const ggufs = getGgufFiles(model);
+  if (ggufs.length > 0 && ggufs.some((f) => f.size > 0)) {
+    return resolveGgufFile(model, selectedGguf)?.size ?? 0;
   }
 
+  if (ggufs.length === 0) {
+    const fromSiblings = (model.siblings ?? []).reduce((acc, f) => acc + siblingSize(f), 0);
+    if (fromSiblings > 0) return fromSiblings;
+
+    const safetensorsTotal = (model as HFModelDetail).safetensors?.total;
+    if (typeof safetensorsTotal === 'number' && safetensorsTotal > 0) {
+      return safetensorsTotal;
+    }
+  }
+
+  // No real sizes available: guess from the parameter count in the name.
   const idLike = (model.modelId || model.id || '').toLowerCase();
-  const match = idLike.match(/(\d+(?:\.\d+)?)\s*([bm])/i);
+  const match = idLike.match(/(\d+(?:\.\d+)?)\s*([bm])(?![a-z])/i);
   if (!match) return 0;
   const count = Number(match[1]);
   if (!Number.isFinite(count) || count <= 0) return 0;
   const scale = match[2].toLowerCase() === 'b' ? 1_000_000_000 : 1_000_000;
   const params = count * scale;
-  // Conservative fp16-style estimate: ~2 bytes/parameter.
-  return Math.round(params * 2);
+  // GGUF repos are quantized (~4-bit); everything else assumes fp16 (~2 bytes/parameter).
+  return Math.round(params * (ggufs.length > 0 ? GGUF_BYTES_PER_PARAM : 2));
 }
-
 function getSiblingFilenames(model: HFModel): string[] {
   return (model.siblings ?? []).map((item) => item.rfilename.toLowerCase());
 }

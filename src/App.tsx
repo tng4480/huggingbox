@@ -3,6 +3,7 @@ import './App.css';
 import { useAppStore } from './stores/appStore';
 import { useSystemInfo } from './hooks/useSystemInfo';
 import { loadSettingsFromFile, saveSettingsToFile } from './services/settingsStorage';
+import { useLabStatus } from './hooks/useLabStatus';
 import { useExecution } from './hooks/useExecution';
 import HeaderBar from './components/layout/HeaderBar';
 import StatusBar from './components/layout/StatusBar';
@@ -10,6 +11,7 @@ import ErrorBoundary from './components/shared/ErrorBoundary';
 import BrowseView from './components/browse/BrowseView';
 import ModelDetailView from './components/detail/ModelDetailView';
 import MyModelsView from './components/my-models/MyModelsView';
+import LabView from './components/lab/LabView';
 import SettingsView from './components/settings/SettingsView';
 
 export default function App() {
@@ -22,6 +24,7 @@ export default function App() {
   // Initialise system info polling via Tauri
   useSystemInfo();
   useExecution();
+  useLabStatus();
 
   // Load persisted app settings from app-data on startup
   useEffect(() => {
@@ -73,6 +76,7 @@ export default function App() {
           {currentView === 'model-detail' && <ModelDetailView />}
           {currentView === 'my-models' && <MyModelsView />}
           {currentView === 'settings' && <SettingsView />}
+          {currentView === 'lab' && <LabView />}
         </main>
         <StatusBar />
       </div>

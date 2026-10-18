@@ -116,6 +116,7 @@ export interface RunRecord {
 }
 
 interface AppStore {
+  labJobLabel: string | null;
   activeJobId: string | null;
   activeRunInput: string;
   workspaceDrafts: Record<string, Record<string, unknown>>;
@@ -125,7 +126,7 @@ interface AppStore {
   setWorkspaceDraft: (modelId: string, patch: Record<string, unknown>) => void;
   finishRun: (state: ExecutionState) => void;
   // Navigation
-  currentView: 'browse' | 'model-detail' | 'my-models' | 'settings';
+  currentView: 'browse' | 'model-detail' | 'my-models' | 'settings' | 'lab';
   selectedModelId: string | null;
   activeExecutionModelId: string | null;
   activeExecutionEnvModelId: string | null;
@@ -226,6 +227,7 @@ interface AppStore {
 // ─── Store Implementation ────────────────────────────────────────────────────
 
 export const useAppStore = create<AppStore>()(persist((set) => ({
+  labJobLabel: null,
   activeJobId: null,
   activeRunInput: '',
   workspaceDrafts: {}, modelCache: {}, codeByModel: {}, runHistory: [],
@@ -390,5 +392,5 @@ export const useAppStore = create<AppStore>()(persist((set) => ({
   setDownloadedModels: (models) => set({ downloadedModels: models }),
 }), {
   name: 'huggingbox-workspaces-v1',
-  partialize: s => ({workspaceDrafts: s.workspaceDrafts, modelCache: s.modelCache, codeByModel: s.codeByModel, runHistory: s.runHistory}),
+  partialize: s => ({workspaceDrafts: {...s.workspaceDrafts, lab: {...s.workspaceDrafts.lab, dataset: undefined}}, modelCache: s.modelCache, codeByModel: s.codeByModel, runHistory: s.runHistory}),
 }));

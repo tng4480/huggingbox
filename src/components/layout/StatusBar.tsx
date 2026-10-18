@@ -12,6 +12,7 @@ function formatElapsed(ms: number): string {
 
 export default function StatusBar() {
   const systemInfo = useAppStore((s) => s.systemInfo);
+  const labJobLabel = useAppStore(s => s.labJobLabel);
   const executionState = useAppStore((s) => s.executionState);
   const executionElapsed = useAppStore((s) => s.executionElapsed);
   const executionStats = useAppStore((s) => s.executionStats);
@@ -136,12 +137,13 @@ export default function StatusBar() {
 
       <button
         onClick={() => {
+          if (labJobLabel) { useAppStore.getState().setCurrentView('lab'); return; }
           if (!activeExecutionModelId) return;
           navigateToModel(activeExecutionModelId, { preserveWorkspace: true });
         }}
-        disabled={!isExecutionClickable}
+        disabled={!isExecutionClickable && !labJobLabel}
         title={
-          isExecutionClickable
+          labJobLabel ? 'Open Model Lab' : isExecutionClickable
             ? `Open execution workspace for ${activeExecutionModelId}`
             : 'No active execution workspace'
         }
@@ -157,7 +159,7 @@ export default function StatusBar() {
           padding: 0,
         }}
       >
-        {getExecutionLabel()}
+        {labJobLabel || getExecutionLabel()}
       </button>
 
       <span style={{ ...mono, color: pythonStatus.color }}>

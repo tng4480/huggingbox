@@ -186,3 +186,7 @@ npm run tauri build
 ```
 
 The repair was tested on macOS with a real offline Qwen2.5-0.5B-Instruct run and a second input reusing the loaded model. Windows installers and CUDA/DirectML execution still need testing on those platforms. Runtime routing is not a guarantee that every Hub architecture works; unsupported model/task combinations fail explicitly.
+
+## Model Lab
+
+The Lab tab supports local LoRA training, held-out base/adapter comparisons, and exploratory ordinary/J-lens inspection. See [Model Lab](docs/model-lab.md) for supported backends, data format, checkpoint recovery and important interpretation limits.

@@ -1,11 +1,12 @@
 import { Sun, Moon, Box } from 'lucide-react';
 import { useAppStore } from '../../stores/appStore';
 
-type NavView = 'browse' | 'my-models' | 'settings';
+type NavView = 'browse' | 'my-models' | 'settings' | 'lab';
 
 const NAV_TABS: { label: string; view: NavView }[] = [
   { label: 'Browse', view: 'browse' },
   { label: 'My Models', view: 'my-models' },
+  { label: 'Lab', view: 'lab' },
   { label: 'Settings', view: 'settings' },
 ];
 

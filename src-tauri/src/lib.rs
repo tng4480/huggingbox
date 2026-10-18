@@ -1,3 +1,4 @@
+mod lab;
 mod assistant_cli;
 use std::sync::{Arc, Mutex};
 #[cfg(target_os = "windows")]
@@ -52,6 +53,7 @@ pub struct ExecutionHandle {
     pub download_pid: Arc<Mutex<Option<u32>>>,
     pub preparation_pid: Arc<Mutex<Option<u32>>>,
     pub preparation_cancelled: Arc<AtomicBool>,
+    pub lab_busy: Arc<AtomicBool>,
 }
 
 impl ExecutionHandle {
@@ -63,6 +65,7 @@ impl ExecutionHandle {
             download_pid: Arc::new(Mutex::new(None)),
             preparation_pid: Arc::new(Mutex::new(None)),
             preparation_cancelled: Arc::new(AtomicBool::new(false)),
+            lab_busy: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -619,8 +622,10 @@ fn environment_fingerprint(app: AppHandle, model_id: String, env_storage_path: O
 }
 
 #[tauri::command]
-fn begin_preparation(handle: State<'_, ExecutionHandle>) {
+fn begin_preparation(handle: State<'_, ExecutionHandle>) -> Result<(), String> {
+    if handle.lab_busy.load(Ordering::SeqCst) { return Err("Finish or stop the Lab job before preparing inference.".into()); }
     handle.preparation_cancelled.store(false, Ordering::SeqCst);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1679,6 +1684,7 @@ async fn run_python_code(
     let env: std::collections::HashMap<String, String> = command.as_std().get_envs()
         .filter_map(|(k,v)| v.map(|v| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))).collect();
     let mut worker = handle.worker.lock().await;
+    if handle.lab_busy.load(Ordering::SeqCst) { return Err("Finish or stop the Lab job before running inference.".into()); }
     if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Run cancelled.".into()); }
     if handle.execution_pid.lock().unwrap().is_some() { return Err("Another run started while preparing. Wait for it to finish.".into()); }
     if worker.as_ref().is_some_and(|w| w.key != key) {
@@ -1991,7 +1997,7 @@ fn remove_model_cache(storage: &str, model: &str) -> Result<(), String> {
 
 #[tauri::command]
 fn delete_downloaded_model(model_id: String, storage_path: String, handle: State<'_, ExecutionHandle>) -> Result<(), String> {
-    if handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() {
+    if handle.lab_busy.load(Ordering::SeqCst) || handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() {
         return Err("Stop the active job before removing model files.".into());
     }
     remove_model_cache(&storage_path, &model_id)
@@ -2165,7 +2171,7 @@ fn delete_model_environment(
     model_id: String,
     env_storage_path: Option<String>,
 ) -> Result<(), String> {
-    if handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() || handle.worker.try_lock().map(|w| w.is_some()).unwrap_or(true) { return Err("Stop and unload the model before deleting an environment.".into()); }
+    if handle.lab_busy.load(Ordering::SeqCst) || handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() || handle.worker.try_lock().map(|w| w.is_some()).unwrap_or(true) { return Err("Stop and unload the model before deleting an environment.".into()); }
     let root = effective_venv_root(&app, env_storage_path.as_deref())?;
     let dir = model_venv_dir_from_root(&root, &model_id)?;
     if !dir.exists() {
@@ -2941,6 +2947,7 @@ pub fn run() {
     // cleanup_old_temp_scripts requires app handle, so we call it via setup below.
     tauri::Builder::default()
         .manage(ExecutionHandle::new())
+        .manage(lab::LabState::default())
         .setup(|app| {
             cleanup_old_temp_scripts(app.handle());
             Ok(())
@@ -2956,6 +2963,7 @@ pub fn run() {
             detect_python,
             generate_python_code_local,
             assistant_cli::generate_code_with_cli,
+            lab::lab_start, lab::lab_cancel, lab::lab_runs, lab::lab_run_detail, lab::lab_read_dataset, lab::lab_dataset_draft,
             generate_code_with_claude,
             run_python_code,
             unload_model,
@@ -2985,8 +2993,13 @@ pub fn run() {
             get_cached_code,
             upsert_cached_code,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+                app.state::<lab::LabState>().shutdown();
+            }
+        });
 }
 
 #[cfg(test)]

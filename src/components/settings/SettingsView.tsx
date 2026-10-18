@@ -752,7 +752,7 @@ export default function SettingsView() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
           <h2 style={SECTION_TITLE}>About</h2>
           <p style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '13px', color: 'var(--text-muted)' }}>
-            HuggingBox v0.2.0
+            HuggingBox v0.3.0
           </p>
           <a
             href="https://github.com"

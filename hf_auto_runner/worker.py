@@ -26,6 +26,8 @@ def serve(requests, channel):
         job_id = request['job_id']
         script = Path(request['script']).resolve(strict=True)
         os.environ.clear(); os.environ.update(baseline); os.environ.update(request['env'])
+        previous_cwd = os.getcwd()
+        previous_path = sys.path[:]
         os.chdir(script.parent)
         sys.path.insert(0, str(script.parent))
         started = time.perf_counter()
@@ -39,7 +41,8 @@ def serve(requests, channel):
             emit('stderr', job_id, text=traceback.format_exc())
             exit_code = 1
         finally:
-            sys.path.pop(0)
+            sys.path[:] = previous_path
+            os.chdir(previous_cwd)
         emit('done', job_id, exit_code=exit_code, elapsed_ms=int((time.perf_counter()-started)*1000))
 
 

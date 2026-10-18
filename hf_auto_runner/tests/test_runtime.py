@@ -125,6 +125,7 @@ class WorkerTests(unittest.TestCase):
                 script=Path(folder,'main.py');script.write_text('from hf_auto_runner.local_runtime import load_once\nfrom review_factory import create\nimport os\nprint(load_once(create),os.environ.get("HB_INPUT"),os.environ.get("HB_NEGATIVE_PROMPT"))\n')
                 requests=[{'job_id':'first','script':str(script),'env':{'HB_INPUT':'one','HB_NEGATIVE_PROMPT':'old'}},{'job_id':'second','script':str(script),'env':{'HB_INPUT':'two'}}]
                 output=io.StringIO();serve(io.StringIO(''.join(json.dumps(r)+'\n' for r in requests)),output)
+                self.assertEqual(os.getcwd(),cwd)
                 events=[json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual(factory.count,1)
                 self.assertEqual([r['job_id'] for r in events if r['kind']=='done'],['first','second'])
@@ -139,6 +140,7 @@ class WorkerTests(unittest.TestCase):
                 script=Path(folder,'main.py');script.write_text('import os\nif os.environ["HB_INPUT"]=="bad": raise ValueError("expected error")\nprint("recovered")\n')
                 requests=[{'job_id':v,'script':str(script),'env':{'HB_INPUT':v}} for v in ['bad','good']]
                 output=io.StringIO();serve(io.StringIO(''.join(json.dumps(r)+'\n' for r in requests)),output)
+                self.assertEqual(os.getcwd(),cwd)
                 events=[json.loads(line) for line in output.getvalue().splitlines()]
                 self.assertEqual([r['exit_code'] for r in events if r['kind']=='done'],[1,0])
         finally:os.chdir(cwd);os.environ.clear();os.environ.update(environment)

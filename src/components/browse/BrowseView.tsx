@@ -152,6 +152,9 @@ export default function BrowseView() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      <div className="task-shortcuts" aria-label="Choose a task"><span>Start with a task:</span>{[
+        ['Text generation', 'text-generation'], ['Transcribe audio', 'automatic-speech-recognition'], ['Generate images', 'text-to-image'],
+      ].map(([label, task]) => <Button key={task} onClick={() => handlePipelineChange(task)}>{label}</Button>)}<span>RAM estimates are not runtime verification.</span></div>
       {/* Search + Filters bar */}
       <div
         style={{

@@ -181,9 +181,6 @@ class ScriptGenerator:
         if self.runtime == "onnxruntime":
             return self._onnxruntime_template()
         if self.runtime == "diffusers":
-            # AMD/Intel: use stable-diffusion-cpp-python with Vulkan (installed in Sprint 3)
-            if self.gpu_backend in ("amd", "intel"):
-                return self._sd_cpp_template()
             return self._diffusers_template()
         if self.runtime == "transformers_multimodal":
             return self._multimodal_template()
@@ -214,7 +211,10 @@ class ScriptGenerator:
         """
         if self.gpu_backend in ("amd", "intel"):
             return (
-                'if torch.cuda.is_available():\n'
+                'if os.environ.get("HB_DEVICE") == "cpu":\n'
+                '    device = "cpu"\n'
+                '    torch_dtype = torch.float32\n'
+                'elif torch.cuda.is_available():\n'
                 '    device = "cuda"\n'
                 '    torch_dtype = torch.float16\n'
                 'else:\n'
@@ -228,7 +228,7 @@ class ScriptGenerator:
                 'print(f"[HuggingBox] Device: {device}", flush=True)'
             )
         return (
-            'device = "cuda" if torch.cuda.is_available() else "cpu"\n'
+            'device = "cuda" if os.environ.get("HB_DEVICE") != "cpu" and torch.cuda.is_available() else "cpu"\n'
             'torch_dtype = torch.float16 if device == "cuda" else torch.float32'
         )
 
@@ -257,7 +257,8 @@ import os
 from huggingface_hub import hf_hub_download
 from stable_diffusion_cpp import StableDiffusion
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 hf_token = os.environ.get("HF_TOKEN") or None
 
 # Weights file selected at code-generation time
@@ -267,7 +268,7 @@ if not weights_file:
 
 print("[HuggingBox] Backend:  stable-diffusion-cpp / Vulkan", flush=True)
 print(f"Downloading {{weights_file}}...", flush=True)
-model_path = hf_hub_download(repo_id=model_id, filename=weights_file, token=hf_token)
+model_path = model_file("{self.model_id}", weights_file, hf_token)
 
 print("Loading model...", flush=True)
 sd = StableDiffusion(model_path=model_path, verbose=False)
@@ -337,7 +338,8 @@ import os
 import time
 from huggingface_hub import hf_hub_download
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 hf_token = os.environ.get("HF_TOKEN") or None
 
 # GGUF file selected at code-generation time
@@ -352,14 +354,14 @@ print(f"[HuggingBox] Backend:  {backend_label}", flush=True)
 print(f"[HuggingBox] VRAM:     {vram_label}  |  Offload: {offload_label}", flush=True)
 print(f"[HuggingBox] Options:  flash_attn={flash_attn}  kv_cache=Q{kv_type}_0", flush=True)
 print(f"Downloading {{gguf_file}}...", flush=True)
-model_path = hf_hub_download(repo_id=model_id, filename=gguf_file, token=hf_token)
+model_path = model_file("{self.model_id}", gguf_file, hf_token)
 
 from llama_cpp import Llama
 print("Loading model...", flush=True)
 _load_start = time.perf_counter()
-llm = Llama(
+llm = load_once(Llama,
     model_path=model_path,
-    n_gpu_layers={n_gpu_layers},
+    n_gpu_layers=0 if os.environ.get("HB_DEVICE") == "cpu" else {n_gpu_layers},
     n_ctx=4096,
     flash_attn={flash_attn},
     type_k={kv_type},
@@ -385,7 +387,7 @@ for chunk in llm(prompt, max_tokens=256, stream=True):
 elapsed = max(time.perf_counter() - start, 1e-9)
 text = "".join(collected)
 tps = token_count / elapsed
-print(f"\\n\\n[HuggingBox] {token_count} tokens · {{elapsed:.1f}}s · {{tps:.1f}} tok/s", flush=True)
+print(f"\\n\\n[HuggingBox] {{token_count}} tokens · {{elapsed:.1f}}s · {{tps:.1f}} tok/s", flush=True)
 print("HB_RUNTIME:llama_cpp")
 print("HB_METRIC_INFERENCE_SECONDS:" + str(elapsed))
 print("HB_METRIC_TOKENS:" + str(token_count))
@@ -405,7 +407,8 @@ from urllib.request import urlopen
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, pipeline
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 pipeline_tag = "{pipeline_tag}"
 hf_token = os.environ.get("HF_TOKEN") or None
 hb_input = os.environ.get("HB_INPUT", "").strip()
@@ -452,8 +455,8 @@ def _load_model():
     try:
         if pipeline_tag == "text-classification":
             from optimum.onnxruntime import ORTModelForSequenceClassification
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            model = ORTModelForSequenceClassification.from_pretrained(
+            tokenizer = load_once(AutoTokenizer.from_pretrained, model_id, token=hf_token, trust_remote_code=True)
+            model = load_once(ORTModelForSequenceClassification.from_pretrained,
                 model_id,
                 provider=active,
                 use_io_binding=active == "CUDAExecutionProvider",
@@ -462,8 +465,8 @@ def _load_model():
             return pipeline("text-classification", model=model, tokenizer=tokenizer)
         if pipeline_tag == "token-classification":
             from optimum.onnxruntime import ORTModelForTokenClassification
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            model = ORTModelForTokenClassification.from_pretrained(
+            tokenizer = load_once(AutoTokenizer.from_pretrained, model_id, token=hf_token, trust_remote_code=True)
+            model = load_once(ORTModelForTokenClassification.from_pretrained,
                 model_id,
                 provider=active,
                 use_io_binding=active == "CUDAExecutionProvider",
@@ -472,8 +475,8 @@ def _load_model():
             return pipeline("token-classification", model=model, tokenizer=tokenizer)
         if pipeline_tag == "feature-extraction" or pipeline_tag == "sentence-similarity":
             from optimum.onnxruntime import ORTModelForFeatureExtraction
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            model = ORTModelForFeatureExtraction.from_pretrained(
+            tokenizer = load_once(AutoTokenizer.from_pretrained, model_id, token=hf_token, trust_remote_code=True)
+            model = load_once(ORTModelForFeatureExtraction.from_pretrained,
                 model_id,
                 provider=active,
                 use_io_binding=active == "CUDAExecutionProvider",
@@ -482,8 +485,8 @@ def _load_model():
             return pipeline("feature-extraction", model=model, tokenizer=tokenizer)
         if pipeline_tag == "question-answering":
             from optimum.onnxruntime import ORTModelForQuestionAnswering
-            tokenizer = AutoTokenizer.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            model = ORTModelForQuestionAnswering.from_pretrained(
+            tokenizer = load_once(AutoTokenizer.from_pretrained, model_id, token=hf_token, trust_remote_code=True)
+            model = load_once(ORTModelForQuestionAnswering.from_pretrained,
                 model_id,
                 provider=active,
                 use_io_binding=active == "CUDAExecutionProvider",
@@ -492,8 +495,8 @@ def _load_model():
             return pipeline("question-answering", model=model, tokenizer=tokenizer)
         if pipeline_tag == "image-classification":
             from optimum.onnxruntime import ORTModelForImageClassification
-            processor = AutoProcessor.from_pretrained(model_id, token=hf_token, trust_remote_code=True)
-            model = ORTModelForImageClassification.from_pretrained(
+            processor = load_once(AutoProcessor.from_pretrained, model_id, token=hf_token, trust_remote_code=True)
+            model = load_once(ORTModelForImageClassification.from_pretrained,
                 model_id,
                 provider=active,
                 use_io_binding=active == "CUDAExecutionProvider",
@@ -549,7 +552,8 @@ from diffusers import (
     StableDiffusionXLPipeline,
 )
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 pipeline_tag = "{pipeline_tag}"
 model_type = "{model_type}"
 architecture_name = "{self.architecture}"
@@ -662,7 +666,7 @@ seed_text = os.environ.get("HB_SEED", "").strip()
 num_images = max(1, _read_env_int("HB_NUM_IMAGES", 1))
 strength = max(0.0, min(1.0, _read_env_float("HB_STRENGTH", 0.75)))
 output_dir = os.environ.get("HB_OUTPUT_DIR", "").strip() or os.path.abspath(os.path.join(os.getcwd(), "outputs"))
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if os.environ.get("HB_DEVICE") != "cpu" and torch.cuda.is_available() else "cpu"
 torch_dtype = torch.float32
 is_sdxl = _is_sdxl_family()
 
@@ -705,7 +709,7 @@ else:
 print(f"Selected pipeline class: {{pipeline_cls.__name__}}", flush=True)
 print("Loading pipeline weights...", flush=True)
 
-pipe = pipeline_cls.from_pretrained(
+pipe = load_once(pipeline_cls.from_pretrained,
     model_id,
     torch_dtype=torch_dtype,
     token=hf_token,
@@ -844,7 +848,8 @@ import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 pipeline_tag = "{pipeline_tag}"
 model_type = "{model_type}"
 architecture_name = "{self.architecture}"
@@ -1037,11 +1042,11 @@ print(f"Effective prompt: {{prompt}}", flush=True)
 
 try:
     print("Loading processor...", flush=True)
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, token=hf_token)
+    processor = load_once(AutoProcessor.from_pretrained, model_id, trust_remote_code=True, token=hf_token)
 
     print("Loading multimodal model weights...", flush=True)
     try:
-        model = AutoModelForImageTextToText.from_pretrained(
+        model = load_once(AutoModelForImageTextToText.from_pretrained,
             model_id,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
@@ -1050,7 +1055,7 @@ try:
         print("Loaded model via AutoModelForImageTextToText.", flush=True)
     except Exception as model_load_error:
         print(f"AutoModelForImageTextToText failed; retrying AutoModelForCausalLM: {{model_load_error}}", flush=True)
-        model = AutoModelForCausalLM.from_pretrained(
+        model = load_once(AutoModelForCausalLM.from_pretrained,
             model_id,
             torch_dtype=torch_dtype,
             trust_remote_code=True,
@@ -1096,7 +1101,8 @@ import soundfile as sf
 import torch
 from transformers import pipeline
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 pipeline_tag = "{pipeline_tag}"
 model_type = "{model_type}"
 hf_token = os.environ.get("HF_TOKEN") or None
@@ -1343,14 +1349,15 @@ import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 hf_token = os.environ.get("HF_TOKEN") or None
 {device_init}
 {advisory}
 print(f"Loading LLM {{model_id}} onto {{device}}...", flush=True)
 try:
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, token=hf_token)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer = load_once(AutoTokenizer.from_pretrained, model_id, trust_remote_code=True, token=hf_token)
+    model = load_once(AutoModelForCausalLM.from_pretrained,
         model_id,
         torch_dtype=torch_dtype,
         trust_remote_code=True,
@@ -1424,17 +1431,33 @@ import os
 import torch
 from transformers import pipeline
 
-model_id = "{self.model_id}"
+from hf_auto_runner.local_runtime import model_source, model_file, load_once
+model_id = model_source("{self.model_id}")
 hf_token = os.environ.get("HF_TOKEN") or None
 {device_init}
 
 print(f"Loading generic pipeline for {{model_id}}...", flush=True)
 try:
-    pipe = pipeline(model=model_id, device=device, token=hf_token)
+    pipe = load_once(pipeline, model=model_id, device=device, token=hf_token)
 
     print(f"Pipeline created: {{pipe.task}}")
-    print("Due to lack of metadata, automatic inference cannot deduce input type.")
-    print("Pipeline successfully initialized. To use it, pass appropriate inputs directly.")
+    import json
+    value = os.environ.get("HB_INPUT", "").strip()
+    if not value:
+        raise ValueError("Enter an input before running this task.")
+    if pipe.task == "question-answering":
+        try:
+            value = json.loads(value)
+        except ValueError:
+            question, separator, context = value.partition("\\nContext:")
+            if not separator:
+                raise ValueError('Use JSON with question/context or Question: ... followed by Context: ...')
+            value = {{"question": question.removeprefix("Question:").strip(), "context": context.strip()}}
+        if not isinstance(value, dict) or not value.get("question") or not value.get("context"):
+            raise ValueError("Question and context are required.")
+    result = pipe(value)
+    print("OUTPUT:", flush=True)
+    print(json.dumps(result, default=lambda item: item.tolist() if hasattr(item, "tolist") else str(item)), flush=True)
 
 except Exception as e:
     print(f"Failed to initialize generic pipeline: {{e}}")

@@ -16,7 +16,7 @@ interface ModelCardProps {
 }
 
 const COMPAT_CONFIG = {
-  compatible: { dot: 'var(--success)', label: 'Compatible' },
+  compatible: { dot: 'var(--success)', label: 'Estimated RAM fit' },
   tight: { dot: 'var(--warning)', label: 'May be tight' },
   'too-large': { dot: 'var(--error)', label: 'Too large' },
   unknown: { dot: 'var(--text-muted)', label: '' },

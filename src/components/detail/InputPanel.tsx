@@ -16,6 +16,7 @@ interface InputPanelProps {
   onRun: () => void;
   onCancel: () => void;
   isRunning: boolean;
+  disabled?: boolean;
   modelSize?: string;
   modelFormat?: string;
   ramEstimate?: string;
@@ -299,6 +300,7 @@ export default function InputPanel({
   onRun,
   onCancel,
   isRunning,
+  disabled = false,
   modelSize,
   modelFormat,
   ramEstimate,
@@ -925,15 +927,7 @@ export default function InputPanel({
           flexShrink: 0,
         }}
       >
-        <div
-          style={{
-            display: 'flex',
-            flexDirection: 'column',
-            gap: '6px',
-            paddingBottom: 'var(--space-xs)',
-          }}
-        >
-          <span style={sectionLabelStyle}>Run Mode</span>
+        <details className="execution-options"><summary>Advanced execution</summary>
           <label style={radioLabelStyle(isRunning)}>
             <input
               type="radio"
@@ -954,14 +948,15 @@ export default function InputPanel({
               disabled={isRunning}
               style={{ accentColor: 'var(--accent-primary)' }}
             />
-            Direct Run: skip app-managed dependency and probe steps
+            Direct Run: use a previously prepared model without repair checks
           </label>
-        </div>
+        </details>
         {!isRunning ? (
           <Button
             variant="primary"
             icon={<Play size={13} fill="currentColor" strokeWidth={0} />}
             onClick={onRun}
+            disabled={disabled}
             style={{ width: '100%', justifyContent: 'center' }}
           >
             Run

@@ -26,7 +26,14 @@ jobs:
         with:
           workspaces: src-tauri
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - run: npm ci
+      - run: npm test
+      - run: npm run test:python
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -35,5 +42,5 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: HuggingBox ${{ github.ref_name }}
           releaseBody: See the commit history for changes in this release.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false

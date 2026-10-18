@@ -4,9 +4,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../stores/appStore';
 import { listDownloadedModels } from '../services/modelStorage';
 import { listModelEnvironments } from '../services/modelEnvironments';
-import { confirmDialog, messageDialog } from '../services/dialogs';
+import { confirmDialog } from '../services/dialogs';
 import {
-  clearPreferredEnvModelId,
   getPreferredEnvModelId,
   setPreferredEnvModelId,
 } from '../services/modelEnvPreference';
@@ -18,6 +17,7 @@ interface ModelDependencyProbeResult {
 }
 
 interface ExecutionStatsPayload {
+  job_id?: string;
   pid: number;
   rss_bytes: number;
   virtual_memory_bytes: number;
@@ -168,15 +168,6 @@ function uniqueRequirementSpecs(items: string[]): string[] {
   return out;
 }
 
-function filterRequirementSpecsByMissing(specs: string[], missingPackages: string[]): string[] {
-  const missing = new Set(missingPackages.map((item) => normalizeDependencyName(item)));
-  return specs.filter((spec) => missing.has(requirementPackageName(spec)));
-}
-
-function hasVersionSpecifier(requirement: string): boolean {
-  return /[<>=!~]/.test(requirement);
-}
-
 function detectRuntimeTypeFromCode(code: string | null | undefined): string {
   const raw = (code ?? '').trim();
   if (!raw) return 'transformers_llm';
@@ -195,7 +186,7 @@ function runtimeDependenciesForType(runtimeType: string): string[] {
     return ['transformers', 'accelerate', 'torch', 'torchvision', 'pillow', 'sentencepiece'];
   }
   if (runtime.startsWith('transformers')) {
-    return ['transformers'];
+    return ['torch', 'transformers', 'pillow'];
   }
   if (runtime.startsWith('diffusers')) {
     return ['diffusers', 'transformers', 'accelerate', 'torch', 'torchvision', 'pillow'];
@@ -206,98 +197,33 @@ function runtimeDependenciesForType(runtimeType: string): string[] {
   if (runtime.startsWith('sentence_transformers')) {
     return ['sentence-transformers', 'transformers'];
   }
-  return ['transformers'];
+  return ['torch', 'transformers', 'pillow'];
 }
 
-function modelRunOnceKey(modelId: string): string {
-  return `huggingbox:model-run-once:${modelId}`;
+let activePreparation: {id: string; cancelled: boolean; settled: Promise<void>} | null = null;
+const PREPARED_KEY = 'huggingbox-prepared-v1';
+const prepared = new Set<string>();
+try { const saved: unknown = JSON.parse(localStorage.getItem(PREPARED_KEY) || '[]'); if (Array.isArray(saved)) for (const item of saved) if (typeof item === 'string') prepared.add(item); } catch { /* Corrupt readiness data is safely rebuilt. */ }
+function savePrepared() { try { localStorage.setItem(PREPARED_KEY, JSON.stringify([...prepared].slice(-100))); } catch { /* Running does not depend on persistence. */ } }
+async function preparationKey(parts: unknown[]): Promise<string> {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(parts)));
+  return [...new Uint8Array(hash)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+let activePreparationKey: string | null = null;
+let cancellingJobId: string | null = null;
+
+async function chooseExecutionEnvModelId(modelId: string, envStoragePath?: string, requested?: string): Promise<string> {
+  const preferred = requested || getPreferredEnvModelId(modelId) || modelId;
+  if (preferred !== modelId) {
+    const envs = await listModelEnvironments(envStoragePath);
+    if (!envs.some(e => e.modelId === preferred)) throw new Error('The selected environment no longer exists. Select a new isolated environment.');
+  }
+  setPreferredEnvModelId(modelId, preferred);
+  return preferred;
 }
 
-function hasModelRunOnce(modelId: string): boolean {
-  try {
-    return localStorage.getItem(modelRunOnceKey(modelId)) === '1';
-  } catch {
-    return false;
-  }
-}
-
-function markModelRunOnce(modelId: string): void {
-  try {
-    localStorage.setItem(modelRunOnceKey(modelId), '1');
-  } catch {
-    // ignore storage failures
-  }
-}
-
-async function chooseExecutionEnvModelId(
-  modelId: string,
-  envStoragePath?: string
-): Promise<string | null> {
-  const envs = await listModelEnvironments(envStoragePath);
-  const envIds = envs.map((e) => e.modelId);
-  const hasOwnEnv = envIds.includes(modelId);
-
-  if (hasOwnEnv) {
-    setPreferredEnvModelId(modelId, modelId);
-    appendLog(`Using model environment: ${modelId}`);
-    return modelId;
-  }
-
-  const preferred = getPreferredEnvModelId(modelId);
-  if (preferred && envIds.includes(preferred)) {
-    appendLog(`Using saved shared environment: ${preferred}`);
-    return preferred;
-  }
-  if (preferred && !envIds.includes(preferred)) {
-    clearPreferredEnvModelId(modelId);
-    appendLog(`Saved shared environment not found anymore: ${preferred}`);
-  }
-
-  const createNew = await confirmDialog(
-    `No Python environment exists for this model yet:\n${modelId}\n\nCreate a new isolated environment? (Recommended)\n\nClick Cancel to use an existing environment.`
-  );
-  if (createNew) {
-    setPreferredEnvModelId(modelId, modelId);
-    appendLog('Environment choice: create new isolated environment.');
-    return modelId;
-  }
-
-  const candidates = envIds.filter((id) => id !== modelId);
-  if (candidates.length === 0) {
-    await messageDialog('No existing environments were found. Creating a new isolated environment instead.', {
-      kind: 'info',
-    });
-    setPreferredEnvModelId(modelId, modelId);
-    appendLog('No reusable environments found; falling back to new isolated environment.');
-    return modelId;
-  }
-
-  const preview = candidates.slice(0, 12).join('\n');
-  const picked = window.prompt(
-    `Choose an existing environment by model id:\n\n${preview}\n\nEnter exact model id:`,
-    candidates[0]
-  );
-  if (picked === null) {
-    appendLog('Environment selection cancelled by user.');
-    return null;
-  }
-
-  const chosen = picked.trim();
-  if (!chosen) {
-    appendLog('Environment selection cancelled (empty input).');
-    return null;
-  }
-  if (!candidates.includes(chosen)) {
-    await messageDialog(`Environment "${chosen}" was not found in the existing environment list.`, {
-      kind: 'warning',
-    });
-    appendLog(`Invalid shared environment selected: ${chosen}`);
-    return null;
-  }
-
-  setPreferredEnvModelId(modelId, chosen);
-  appendLog(`Environment choice: reuse existing environment ${chosen}`);
-  return chosen;
+function isCurrentEvent(payload: {job_id?: string}): boolean {
+  return Boolean(payload.job_id && payload.job_id !== cancellingJobId && payload.job_id === useAppStore.getState().activeJobId);
 }
 
 async function ensureExecutionListenersRegistered(): Promise<void> {
@@ -310,15 +236,18 @@ async function ensureExecutionListenersRegistered(): Promise<void> {
   executionListenersInitPromise = (async () => {
     const unlistens: Array<() => void> = [];
 
-    const u1 = await listen<{ text: string }>('execution-stdout', (e) => {
+    const u1 = await listen<{ text: string; job_id?: string }>('execution-stdout', (e) => {
+      if (!isCurrentEvent(e.payload)) return;
       queueStdout(e.payload.text);
     });
 
-    const u2 = await listen<{ text: string }>('execution-stderr', (e) => {
+    const u2 = await listen<{ text: string; job_id?: string }>('execution-stderr', (e) => {
+      if (!isCurrentEvent(e.payload)) return;
       queueStderr(e.payload.text);
     });
 
-    const u3 = await listen<{ exit_code: number }>('execution-done', (e) => {
+    const u3 = await listen<{ exit_code: number; job_id?: string }>('execution-done', (e) => {
+      if (!isCurrentEvent(e.payload)) return;
       flushBufferedStreams();
       const state =
         e.payload.exit_code === 0
@@ -330,8 +259,11 @@ async function ensureExecutionListenersRegistered(): Promise<void> {
         clearInterval(executionTimer);
         executionTimer = null;
       }
-      useAppStore.getState().setExecutionState(state);
       appendLog(`Execution finished with exit code ${e.payload.exit_code}.`);
+      if (state === 'error' && activePreparationKey) { prepared.delete(activePreparationKey); savePrepared(); }
+      const started = useAppStore.getState().executionStartTime;
+      if (started) useAppStore.getState().setExecutionElapsed(Date.now() - started);
+      useAppStore.getState().finishRun(state);
     });
 
     const u4 = await listen<{ text: string }>('install-progress', (e) => {
@@ -367,12 +299,13 @@ async function ensureExecutionListenersRegistered(): Promise<void> {
     });
 
     const u7 = await listen<ExecutionStatsPayload>('execution-stats', (e) => {
+      if (!isCurrentEvent(e.payload)) return;
       useAppStore.getState().setExecutionStats({
         processRssBytes: e.payload.rss_bytes,
         processVirtualMemoryBytes: e.payload.virtual_memory_bytes,
         processGpuBytes: e.payload.gpu_memory_bytes ?? null,
       });
-      useAppStore.getState().setExecutionElapsed(e.payload.elapsed_ms);
+
     });
 
     unlistens.push(u1, u2, u3, u4, u5, u6, u7);
@@ -440,6 +373,9 @@ export function useExecution() {
   const runCode = useCallback(async (
     options?: {
       modelId?: string;
+      ggufFile?: string;
+      environmentId?: string;
+      repair?: boolean;
       storagePath?: string;
       hfToken?: string;
       pipelineTag?: string | null;
@@ -466,444 +402,110 @@ export function useExecution() {
     }
   ) => {
     const store = useAppStore.getState();
+    if (store.activeJobId || activePreparation || cancellingJobId) return;
+    const modelId = options?.modelId?.trim();
+    if (!modelId || !options?.scriptRelativePath || !options.runtimeSourceCode?.trim()) {
+      store.setExecutionError('Prepare a supported model before running. The script is empty.');
+      return;
+    }
+    const job = {id: crypto.randomUUID(), cancelled: false, settled: Promise.resolve()};
+    activePreparation = job;
+    useAppStore.setState({activeJobId: job.id, activeExecutionModelId: modelId, activeRunInput: options.userInput ?? ''});
     resetBufferedStreams();
-    store.clearExecutionOutput();
-    store.clearStderrOutput();
-    store.clearExecutionStats();
-    store.setExecutionError(null);
-    store.setDownloadStats(null);
-    store.setExecutionState('running');
-    startTimer();
-
-    const modelId = options?.modelId?.trim() || '';
-    let executionEnvModelId: string | null = modelId || null;
-    if (modelId) {
-      store.setActiveExecutionModelId(modelId);
-
+    store.clearExecutionOutput(); store.clearStderrOutput(); store.clearExecutionStats(); store.setExecutionElapsed(0);
+    store.setExecutionError(null); store.setDownloadStats(null);
+    store.setExecutionState('installing'); startTimer();
+    const check = () => { if (job.cancelled || useAppStore.getState().activeJobId !== job.id) throw new Error('Run cancelled.'); };
+    async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+      check(); const value = await invoke<T>(command, args); check(); return value;
+    }
+    const perform = async () => {
       try {
-        executionEnvModelId = await chooseExecutionEnvModelId(modelId, options?.envStoragePath);
+        await call('begin_preparation');
+        const environment = await chooseExecutionEnvModelId(modelId, options.envStoragePath, options.environmentId);
+        check(); store.setActiveExecutionEnvModelId(environment);
+        const runtime = detectRuntimeTypeFromCode(options.runtimeSourceCode);
+        const context = {modelId, venvModelId: environment, envStoragePath: options.envStoragePath || null};
+        const fingerprint = await call<string>('environment_fingerprint', {modelId: environment, envStoragePath: options.envStoragePath || null});
+        const identity = [modelId, environment, options.envStoragePath, options.storagePath, options.ggufFile, runtime, options.runtimeSourceCode, options.preferredDevice, options.selectedGpuId];
+        const key = await preparationKey([...identity, fingerprint]); check();
+        activePreparationKey = key;
+        if (options.repair) prepared.delete(key);
+        const downloaded = await call<boolean>('is_model_downloaded', {modelId, storagePath: options.storagePath, runtime, ggufFile: options.ggufFile ?? null});
+        if (!downloaded) prepared.delete(key);
+        if (options.runMode !== 'direct' && !prepared.has(key)) {
+          const approve = await confirmDialog('Prepare this model? HuggingBox will install its required packages in the selected environment, download only the selected model files, and verify readiness. Your scripts and results are kept separately from disposable weights.', {okLabel: 'Prepare and run', cancelLabel: 'Cancel'});
+          check();
+          if (!approve) { job.cancelled = true; throw new Error('Preparation cancelled.'); }
+          const dependencies = uniqueDependencies(['huggingface_hub', ...runtimeDependenciesForType(runtime)]);
+          const missing = await call<string[]>('check_packages', {...context, packages: dependencies});
+          if (missing.length) {
+            appendLog(`Installing required packages: ${missing.join(', ')}`);
+            await call('install_packages', {...context, packages: missing});
+          }
+          if (!downloaded) {
+            store.setExecutionState('downloading'); appendLog('Downloading selected model files…');
+            await call('download_model', {...context, storagePath: options.storagePath, hfToken: options.hfToken || null, runtime, ggufFile: options.ggufFile ?? null});
+            const models = await listDownloadedModels(options.storagePath!); check(); store.setDownloadedModels(models);
+          }
+          store.setExecutionState('installing'); appendLog('Checking model requirements…');
+          const probe = await call<ModelDependencyProbeResult>('probe_model_dependencies', {...context, hfToken: options.hfToken || null, storagePath: options.storagePath});
+          const requirements = uniqueRequirementSpecs([...(probe.requiredPackages ?? []), ...(probe.missingPackages ?? [])]);
+          if (requirements.length) {
+            const missingNames = await call<string[]>('check_packages', {...context, packages: requirements});
+            const missingSet = new Set(missingNames.map(requirementPackageName));
+            const needed = requirements.filter(r => missingSet.has(requirementPackageName(r)) || Boolean(probe.compatibilityError));
+            if (needed.length) await call('install_packages', {...context, packages: needed});
+          }
+          if (probe.compatibilityError || requirements.length) {
+            const verified = await call<ModelDependencyProbeResult>('probe_model_dependencies', {...context, hfToken: options.hfToken || null, storagePath: options.storagePath});
+            if (verified.compatibilityError || verified.missingPackages.length) throw new Error(verified.compatibilityError || `Missing packages: ${verified.missingPackages.join(', ')}`);
+          }
+          const readyFingerprint = await call<string>('environment_fingerprint', {modelId: environment, envStoragePath: options.envStoragePath || null});
+          activePreparationKey = await preparationKey([...identity, readyFingerprint]); check();
+          prepared.add(activePreparationKey); savePrepared(); appendLog('Model prepared. Future runs reuse this setup.');
+        } else if (options.runMode === 'direct' && !downloaded) {
+          throw new Error('Prepare this model before using direct execution.');
+        }
+        check(); store.setDownloadStats(null); store.setExecutionState('running');
+        await call('run_python_code', {
+          jobId: job.id, modelId, venvModelId: environment, storagePath: options.storagePath,
+          preferredDevice: options.preferredDevice ?? 'auto', selectedGpuId: options.selectedGpuId ?? null,
+          hfToken: options.hfToken ?? null, userInput: options.userInput ?? null,
+          envStoragePath: options.envStoragePath || null, scriptRelativePath: options.scriptRelativePath,
+          diffusionMode: options.diffusionMode ?? null, outputDir: options.outputDir ?? null,
+          negativePrompt: options.negativePrompt ?? null, steps: options.steps ?? null, guidanceScale: options.guidanceScale ?? null,
+          seed: options.seed ?? null, numImages: options.numImages ?? null, strength: options.strength ?? null,
+          sourceImagePath: options.sourceImagePath ?? null, maskImagePath: options.maskImagePath ?? null,
+          multimodalTask: options.multimodalTask ?? null, imagePath: options.imagePath ?? null, documentPath: options.documentPath ?? null,
+        });
       } catch (error) {
-        appendLog(`Environment discovery failed; defaulting to a new isolated environment. ${String(error)}`);
-        executionEnvModelId = modelId;
-      }
-
-      if (!executionEnvModelId) {
+        if (activePreparationKey) { prepared.delete(activePreparationKey); savePrepared(); }
+        if (useAppStore.getState().activeJobId === job.id && cancellingJobId !== job.id) {
+          store.setExecutionError(job.cancelled ? null : String(error));
+          store.finishRun(job.cancelled ? 'cancelled' : 'error');
+        }
         stopTimer();
-        store.setExecutionState('idle');
-        store.setExecutionError('Execution cancelled during Python environment selection.');
-        store.setDownloadStats(null);
-        return;
+      } finally {
+        if (activePreparation === job) activePreparation = null;
       }
-
-      store.setActiveExecutionEnvModelId(executionEnvModelId);
-    }
-
-    const hasRunBefore = modelId ? hasModelRunOnce(modelId) : false;
-    const allowAutoInstall = !hasRunBefore;
-    if (modelId) {
-      markModelRunOnce(modelId);
-    }
-
-    appendLog(`Run requested${modelId ? ` for ${modelId}` : ''}.`);
-    appendLog(
-      options?.runMode === 'direct'
-        ? 'Run mode: direct execution (skipping app-managed dependency and compatibility checks).'
-        : 'Run mode: prepared execution (dependency checks and compatibility probe enabled).'
-    );
-    appendLog(
-      allowAutoInstall
-        ? 'Auto dependency installation is enabled for this first run.'
-        : 'Auto dependency installation is disabled for this model (manual environment mode).'
-    );
-
-    if (options?.runMode !== 'direct' && options?.modelId && options?.storagePath) {
-      try {
-        appendLog(`Checking download readiness in ${options.storagePath}`);
-        const missingDownloadDeps = await invoke<string[]>('check_packages', {
-          packages: ['huggingface_hub'],
-          modelId: options.modelId,
-          venvModelId: executionEnvModelId,
-        });
-
-        if (missingDownloadDeps.length > 0 && !allowAutoInstall) {
-          stopTimer();
-          store.setExecutionState('error');
-          store.setExecutionError(
-            `Download dependencies missing (${missingDownloadDeps.join(', ')}). Auto installs are disabled after first run for this model. Install manually from the terminal panel.`
-          );
-          store.setDownloadStats(null);
-          appendLog(`Missing download dependencies with auto-install disabled: ${missingDownloadDeps.join(', ')}`);
-          return;
-        }
-
-        if (missingDownloadDeps.length > 0) {
-          const approveDeps = await confirmDialog(
-            `Model downloads require ${missingDownloadDeps.join(', ')}.\n\nInstall now?`
-          );
-          if (!approveDeps) {
-            store.setExecutionState('idle');
-            store.setExecutionError('Execution cancelled because download dependency installation was declined.');
-            store.setDownloadStats(null);
-            return;
-          }
-          store.setExecutionState('installing');
-          appendLog(`Installing download dependencies: ${missingDownloadDeps.join(', ')}`);
-          await invoke('install_packages', {
-            packages: missingDownloadDeps,
-            modelId: options.modelId,
-            venvModelId: executionEnvModelId,
-          });
-          appendLog('Download dependency installation complete.');
-        }
-
-        const downloaded = await invoke<boolean>('is_model_downloaded', {
-          modelId: options.modelId,
-          storagePath: options.storagePath,
-        });
-
-        if (!downloaded) {
-          const shouldDownload = await confirmDialog(
-            `Model files are not downloaded yet.\n\nDownload now to:\n${options.storagePath}\n\nYou can pause by clicking Stop and resume later.`
-          );
-          if (!shouldDownload) {
-            store.setExecutionState('idle');
-            store.setExecutionError('Execution cancelled because model files were not downloaded.');
-            store.setDownloadStats(null);
-            return;
-          }
-
-          store.setExecutionState('downloading');
-          appendLog(`Starting model download for ${options.modelId}`);
-          await invoke('download_model', {
-            modelId: options.modelId,
-            storagePath: options.storagePath,
-            hfToken: options.hfToken || null,
-          });
-          const refreshed = await listDownloadedModels(options.storagePath);
-          store.setDownloadedModels(refreshed);
-          appendLog('Download stage complete.');
-          store.setDownloadStats({
-            percent: 100,
-            downloadedBytes: 0,
-            totalBytes: 0,
-            speedBps: 0,
-            etaSeconds: 0,
-            phase: 'complete',
-            filesDone: 0,
-            filesTotal: 0,
-          });
-        }
-      } catch (err) {
-        stopTimer();
-        store.setExecutionState('error');
-        store.setExecutionError(String(err));
-        store.setDownloadStats(null);
-        appendLog(`Preparation failed: ${String(err)}`);
-        return;
-      }
-    }
-
-    if (options?.runMode !== 'direct') {
-      const runtimeType = detectRuntimeTypeFromCode(options?.runtimeSourceCode ?? store.generatedCode);
-      const prefersCudaForOnnx =
-        runtimeType === 'onnxruntime' &&
-        options?.preferredDevice !== 'cpu' &&
-        Boolean(store.systemInfo.gpuName);
-      const runtimePackages = uniqueDependencies([
-        ...runtimeDependenciesForType(runtimeType).map((pkg) =>
-          runtimeType === 'onnxruntime' && pkg === 'onnxruntime' && prefersCudaForOnnx
-            ? 'onnxruntime-gpu'
-            : pkg
-        ),
-        ...(runtimeType === 'transformers_multimodal' && options?.multimodalTask === 'document-understanding'
-          ? ['pymupdf']
-          : []),
-      ]);
-      if (runtimePackages.length > 0) {
-        appendLog(`Detected runtime type: ${runtimeType}`);
-        appendLog(`Checking runtime dependencies before probe: ${runtimePackages.join(', ')}`);
-        try {
-          const missingRuntime = uniqueDependencies(await invoke<string[]>('check_packages', {
-            packages: runtimePackages,
-            modelId: options?.modelId ?? null,
-            venvModelId: executionEnvModelId,
-          }));
-          if (missingRuntime.length > 0) {
-            if (!allowAutoInstall) {
-              stopTimer();
-              store.setExecutionState('error');
-              store.setExecutionError(
-                `Runtime dependencies missing (${missingRuntime.join(', ')}). Auto installs are disabled after first run for this model. Install manually from the terminal panel.`
-              );
-              store.setDownloadStats(null);
-              appendLog(`Missing runtime dependencies with auto-install disabled: ${missingRuntime.join(', ')}`);
-              return;
-            }
-
-            const approved = await confirmDialog(
-              `Runtime dependencies are required before dependency probing:\n\n${missingRuntime.join(', ')}\n\nInstall now?`
-            );
-            if (!approved) {
-              stopTimer();
-              store.setExecutionState('idle');
-              store.setExecutionError(
-                `Execution cancelled. Runtime dependencies were not installed: ${missingRuntime.join(', ')}`
-              );
-              store.setDownloadStats(null);
-              return;
-            }
-
-            store.setExecutionState('installing');
-            appendLog(`Installing runtime dependencies before probe: ${missingRuntime.join(', ')}`);
-            await invoke('install_packages', {
-              packages: missingRuntime,
-              modelId: options?.modelId ?? null,
-              venvModelId: executionEnvModelId,
-            });
-            appendLog('Runtime dependency installation complete.');
-          }
-        } catch (err) {
-          stopTimer();
-          store.setExecutionState('error');
-          store.setExecutionError(`Runtime dependency installation failed: ${String(err)}`);
-          store.setDownloadStats(null);
-          appendLog(`Runtime dependency installation failed: ${String(err)}`);
-          return;
-        }
-      }
-
-      const packages: string[] = [];
-      let requiredFromProbe: string[] = [];
-      let compatibilityWarning: string | null = null;
-
-      if (options?.modelId) {
-        try {
-          appendLog('Running dependency compatibility probe.');
-          const probe = await invoke<ModelDependencyProbeResult>('probe_model_dependencies', {
-            modelId: options.modelId,
-            hfToken: options?.hfToken ?? null,
-            venvModelId: executionEnvModelId,
-          });
-
-          const missingFromProbe = uniqueDependencies(probe.missingPackages ?? []);
-          if (missingFromProbe.length > 0) {
-            packages.push(...missingFromProbe);
-            appendLog(`Model probe found missing imports: ${missingFromProbe.join(', ')}`);
-          }
-
-          requiredFromProbe = uniqueRequirementSpecs(probe.requiredPackages ?? []);
-          if (requiredFromProbe.length > 0) {
-            appendLog(`Model-declared requirements: ${requiredFromProbe.join(', ')}`);
-          }
-
-          if (probe.compatibilityError) {
-            compatibilityWarning = probe.compatibilityError;
-            appendLog(`Compatibility warning: ${probe.compatibilityError}`);
-          }
-        } catch (err) {
-          const probeError = String(err);
-          if (/No module named ['"]?transformers['"]?/i.test(probeError)) {
-            stopTimer();
-            store.setExecutionState('error');
-            store.setExecutionError(
-              'Dependency probe failed because transformers is missing from the selected environment.'
-            );
-            store.setDownloadStats(null);
-            appendLog(`Dependency probe failed due to missing transformers: ${probeError}`);
-            return;
-          }
-          appendLog(`Dependency probe failed (continuing): ${probeError}`);
-        }
-      }
-
-      if (compatibilityWarning && requiredFromProbe.length > 0) {
-        const requirementsToInstall = requiredFromProbe.filter((req) => hasVersionSpecifier(req));
-        if (requirementsToInstall.length > 0) {
-          if (!allowAutoInstall) {
-            appendLog(
-              `Skipping requirement alignment because auto-install is disabled: ${requirementsToInstall.join(', ')}`
-            );
-          } else {
-            const approved = await confirmDialog(
-              `Model compatibility warning detected.\n\nInstall model-declared versioned requirements now?\n\n${requirementsToInstall.join('\n')}`
-            );
-              if (!approved) {
-                store.setExecutionState('idle');
-                store.setExecutionError(
-                  `Execution cancelled. Model requires version-specific dependencies: ${requirementsToInstall.join(', ')}`
-                );
-                store.setDownloadStats(null);
-                return;
-              }
-            try {
-              store.setExecutionState('installing');
-              appendLog(`Aligning environment to model requirements: ${requirementsToInstall.join(', ')}`);
-              await invoke('install_packages', {
-                packages: requirementsToInstall,
-                modelId: options?.modelId ?? null,
-                venvModelId: executionEnvModelId,
-              });
-              appendLog('Requirement alignment complete.');
-            } catch (err) {
-              stopTimer();
-              store.setExecutionState('error');
-              store.setExecutionError(`Requirement alignment failed: ${String(err)}`);
-              store.setDownloadStats(null);
-              appendLog(`Requirement alignment failed: ${String(err)}`);
-              return;
-            }
-          }
-        }
-      }
-
-      if (requiredFromProbe.length > 0) {
-        try {
-          const missingRequiredNames = uniqueDependencies(await invoke<string[]>('check_packages', {
-            packages: uniqueDependencies(requiredFromProbe.map(requirementPackageName)),
-            modelId: options?.modelId ?? null,
-            venvModelId: executionEnvModelId,
-          }));
-          const missingRequiredSpecs = filterRequirementSpecsByMissing(requiredFromProbe, missingRequiredNames);
-
-          if (missingRequiredSpecs.length > 0) {
-            if (!allowAutoInstall) {
-              appendLog(
-                `Skipping model-declared requirement install because auto-install is disabled: ${missingRequiredSpecs.join(', ')}`
-              );
-            } else {
-              const approved = await confirmDialog(
-                `Model-declared Python requirements were found:\n\n${missingRequiredSpecs.join('\n')}\n\nInstall now?`
-              );
-              if (!approved) {
-                store.setExecutionState('idle');
-                store.setExecutionError(
-                  `Execution cancelled. Model-declared requirements were not installed: ${missingRequiredSpecs.join(', ')}`
-                );
-                store.setDownloadStats(null);
-                return;
-              }
-
-              store.setExecutionState('installing');
-              appendLog(`Installing model-declared requirements: ${missingRequiredSpecs.join(', ')}`);
-              await invoke('install_packages', {
-                packages: missingRequiredSpecs,
-                modelId: options?.modelId ?? null,
-                venvModelId: executionEnvModelId,
-              });
-              appendLog('Model-declared requirement installation complete.');
-            }
-          }
-        } catch (err) {
-          stopTimer();
-          store.setExecutionState('error');
-          store.setExecutionError(`Model-declared requirement installation failed: ${String(err)}`);
-          store.setDownloadStats(null);
-          appendLog(`Model-declared requirement installation failed: ${String(err)}`);
-          return;
-        }
-      }
-
-      if (packages.length > 0) {
-        try {
-          const missing = uniqueDependencies(await invoke<string[]>('check_packages', {
-            packages,
-            modelId: options?.modelId ?? null,
-            venvModelId: executionEnvModelId,
-          }));
-          if (missing.length > 0) {
-            if (!allowAutoInstall) {
-              appendLog(`Skipping package install (auto disabled). Missing: ${missing.join(', ')}`);
-            } else {
-              const approved = await confirmDialog(
-                `Missing packages detected:\n\n${missing.join(', ')}\n\nInstall now?`
-              );
-              if (!approved) {
-                store.setExecutionState('idle');
-                store.setExecutionError(
-                  `Execution cancelled. Required packages were not installed: ${missing.join(', ')}`
-                );
-                store.setDownloadStats(null);
-                return;
-              }
-              store.setExecutionState('installing');
-              appendLog(`Installing missing packages: ${missing.join(', ')}`);
-              await invoke('install_packages', {
-                packages: missing,
-                modelId: options?.modelId ?? null,
-                venvModelId: executionEnvModelId,
-              });
-              appendLog('Package installation complete.');
-            }
-          }
-        } catch (err) {
-          stopTimer();
-          store.setExecutionState('error');
-          store.setExecutionError(`Package installation failed: ${String(err)}`);
-          store.setDownloadStats(null);
-          appendLog(`Package installation failed: ${String(err)}`);
-          return;
-        }
-      }
-    } else {
-      appendLog('Skipping runtime dependency installation and compatibility probe.');
-    }
-
-    store.setExecutionState('running');
-
-    appendLog(
-      `Launching runtime with device=${options?.preferredDevice ?? 'auto'}${
-        options?.selectedGpuId ? `, gpu=${options.selectedGpuId}` : ''
-      }${options?.envStoragePath ? `, envStorage=${options.envStoragePath}` : ''}${
-        executionEnvModelId ? `, envModel=${executionEnvModelId}` : ''
-      }${options?.scriptRelativePath ? `, script=${options.scriptRelativePath}` : ''
-      }`
-    );
-
-    try {
-      await invoke('run_python_code', {
-        preferredDevice: options?.preferredDevice ?? 'auto',
-        selectedGpuId: options?.selectedGpuId ?? null,
-        modelId: options?.modelId ?? null,
-        venvModelId: executionEnvModelId,
-        hfToken: options?.hfToken ?? null,
-        userInput: options?.userInput ?? null,
-        envStoragePath: options?.envStoragePath || null,
-        storagePath: options?.storagePath || null,
-        scriptRelativePath: options?.scriptRelativePath || null,
-        diffusionMode: options?.diffusionMode ?? null,
-        outputDir: options?.outputDir ?? null,
-        negativePrompt: options?.negativePrompt ?? null,
-        steps: options?.steps ?? null,
-        guidanceScale: options?.guidanceScale ?? null,
-        seed: options?.seed ?? null,
-        numImages: options?.numImages ?? null,
-        strength: options?.strength ?? null,
-        sourceImagePath: options?.sourceImagePath ?? null,
-        maskImagePath: options?.maskImagePath ?? null,
-        multimodalTask: options?.multimodalTask ?? null,
-        imagePath: options?.imagePath ?? null,
-        documentPath: options?.documentPath ?? null,
-      });
-    } catch (err) {
-      stopTimer();
-      store.setExecutionState('error');
-      store.setExecutionError(String(err));
-      store.setDownloadStats(null);
-      appendLog(`Failed to launch execution: ${String(err)}`);
-    }
+    };
+    job.settled = perform();
+    await job.settled;
   }, []);
 
   const cancelExecution = useCallback(async () => {
-    try {
-      await invoke('cancel_execution');
-      await invoke('cancel_download');
-      appendLog('Cancellation requested.');
-    } catch {
-      // Ignore — process may have already finished
-    }
-    stopTimer();
-    flushBufferedStreams();
-    useAppStore.getState().setExecutionState('cancelled');
+    const job = activePreparation;
+    if (job) job.cancelled = true;
+    const id = useAppStore.getState().activeJobId;
+    if (cancellingJobId) return;
+    cancellingJobId = id;
+    if (id) useAppStore.getState().setExecutionState('stopping');
+    await Promise.allSettled([invoke('cancel_preparation'), invoke('cancel_execution'), invoke('cancel_download')]);
+    if (job) await job.settled;
+    stopTimer(); flushBufferedStreams();
+    if (id && useAppStore.getState().activeJobId === id) useAppStore.getState().finishRun('cancelled');
+    cancellingJobId = null;
     useAppStore.getState().setDownloadStats(null);
   }, []);
 

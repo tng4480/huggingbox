@@ -44,7 +44,7 @@ export default function MyModelsView() {
 
   async function handleDeleteModel(modelId: string) {
     const confirmed = await confirmDialog(
-      `Delete downloaded model files for:\n${modelId}\n\nThis removes the local model folder from storage.`
+      `Remove cached weights for:\n${modelId}\n\nThis removes only managed model weights. Your scripts, results and legacy files are preserved.`
     );
     if (!confirmed) return;
 
@@ -52,8 +52,8 @@ export default function MyModelsView() {
       setDeletingModelId(modelId);
       await deleteDownloadedModel(modelId, storagePath);
       await refreshDownloadedModels();
-    } catch {
-      setLoadError('Could not delete the downloaded model.');
+    } catch (error) {
+      setLoadError(`Could not remove cached weights: ${String(error)}`);
     } finally {
       setDeletingModelId(null);
     }

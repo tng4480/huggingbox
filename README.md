@@ -16,7 +16,7 @@ Prebuilt releases are available here:
 
 - [Download HuggingBox (latest release)](https://github.com/tng4480/huggingbox/releases/latest)
 
-The latest version is [v0.1.1](https://github.com/tng4480/huggingbox/releases/tag/v0.1.1), with a Windows installer (`.exe`) and an `.msi` package.
+Release assets include with a Windows installer (`.exe`) and an `.msi` package.
 
 If there is no release yet for your platform, build it locally using the instructions below.
 
@@ -158,3 +158,31 @@ Important:
 - A [NOTICE](NOTICE) file is included for attribution handling in downstream redistributions.
 - Hugging Face models, downloaded weights, and third-party runtime dependencies may be licensed separately.
 - Always check the license terms for any model or dependency you use or redistribute.
+
+## Reliable preparation and repeat runs
+
+Open a model workspace, enter an input, and choose Run. Preparation verifies the selected environment and downloads the selected runtime files. A successful setup is reused until the recipe, model variant, device, or environment changes. Repair setup & retry rechecks requirements after a failure. Stop cancels preparation as well as inference.
+
+New downloads live in `<model workspace>/.weights`. Removing a downloaded model removes only this managed cache; scripts, output files, and legacy downloads are preserved. Legacy scripts remain editable: use Re-gen to adopt the local-cache recipe contract (the existing script is backed up first). Old weights are not silently moved or deleted.
+
+The worker keeps reusable model components in memory between runs. Unload model releases that memory. Changing the model or recipe restarts the worker. Prompts and workspace choices survive navigation, and the last 20 runs can be compared/exported. Output previews are limited to 16,000 characters; generated files stay in the workspace.
+
+## Signed-in coding assistants
+
+Settings → Code Generation offers **Codex CLI**, **Claude Code**, **Auto Runner**, and **Claude Sonnet API**. Install and sign in to your chosen CLI first (`codex login` or launch `claude`). HuggingBox uses that CLI login; it does not require an API key for CLI providers. Account access and usage limits still apply. Gated Hugging Face repositories still require their own access token.
+
+CLI executables are detected from PATH and common install locations; an absolute executable path can be supplied in Settings. Requests send model documentation and hardware context, plus the current script and diagnostic logs for repair. Stored HuggingBox tokens are redacted from those prompts. CLI responses must contain valid code/analysis/dependency JSON. They return code into the editor; they do not automatically run generated inference. Requests time out after three minutes. Claude Code is invoked without tools; Codex uses a read-only sandbox in a separate temporary working directory.
+
+Official CLI documentation: https://learn.chatgpt.com/docs/non-interactive-mode and https://code.claude.com/docs/en/headless.
+
+## Regression checks
+
+```sh
+npm test
+npm run test:python
+cargo test --manifest-path src-tauri/Cargo.toml --lib
+npm run build
+npm run tauri build
+```
+
+The repair was tested on macOS with a real offline Qwen2.5-0.5B-Instruct run and a second input reusing the loaded model. Windows installers and CUDA/DirectML execution still need testing on those platforms. Runtime routing is not a guarantee that every Hub architecture works; unsupported model/task combinations fail explicitly.

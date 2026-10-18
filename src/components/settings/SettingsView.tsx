@@ -336,12 +336,14 @@ export default function SettingsView() {
           <h2 style={SECTION_TITLE}>Code Generation</h2>
           <Field
             label="Default Generator"
-            helper="Choose whether Generate Code uses the deterministic local auto runner or Anthropic Claude Sonnet reading the model README."
+            helper="Auto Runner works locally. Codex CLI and Claude Code use your existing CLI sign-in and account usage limits; no API key is required in HuggingBox. Model documentation, and code/error logs for repair, are sent to the selected provider."
           >
             <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
               {([
                 { value: 'autorunner', label: 'Auto Runner (default)' },
-                { value: 'claude-sonnet', label: 'Claude Sonnet' },
+                { value: 'codex-cli', label: 'Codex CLI (existing sign-in)' },
+                { value: 'claude-code', label: 'Claude Code (existing sign-in)' },
+                { value: 'claude-sonnet', label: 'Claude Sonnet (API key)' },
               ] as const).map((option) => (
                 <label
                   key={option.value}
@@ -367,6 +369,12 @@ export default function SettingsView() {
                 </label>
               ))}
             </div>
+          </Field>
+          <Field label="Codex CLI executable (optional)" helper="Install Codex CLI and run codex login in a terminal. Leave blank for automatic detection.">
+            <input className="cli-path-input" aria-label="Codex CLI executable" value={settings.codexCliPath || ''} onChange={e => updateSettings({codexCliPath: e.target.value})} placeholder="Absolute path to codex" />
+          </Field>
+          <Field label="Claude Code executable (optional)" helper="Install Claude Code and run claude in a terminal to sign in. Leave blank for automatic detection.">
+            <input className="cli-path-input" aria-label="Claude Code executable" value={settings.claudeCodePath || ''} onChange={e => updateSettings({claudeCodePath: e.target.value})} placeholder="Absolute path to claude" />
           </Field>
           <Field
             label="Anthropic API Key"
@@ -744,7 +752,7 @@ export default function SettingsView() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-sm)' }}>
           <h2 style={SECTION_TITLE}>About</h2>
           <p style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: '13px', color: 'var(--text-muted)' }}>
-            HuggingBox v0.1.0
+            HuggingBox v0.2.0
           </p>
           <a
             href="https://github.com"

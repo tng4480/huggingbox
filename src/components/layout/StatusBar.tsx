@@ -49,6 +49,8 @@ export default function StatusBar() {
         return 'Error';
       case 'cancelled':
         return 'Cancelled';
+      case 'stopping':
+        return 'Stopping…';
       default:
         return 'Idle';
     }

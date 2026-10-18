@@ -12,6 +12,7 @@ const NAV_TABS: { label: string; view: NavView }[] = [
 export default function HeaderBar() {
   const currentView = useAppStore((s) => s.currentView);
   const setCurrentView = useAppStore((s) => s.setCurrentView);
+  const selectedModelId = useAppStore(s => s.selectedModelId);
   const theme = useAppStore((s) => s.settings.theme);
   const setTheme = useAppStore((s) => s.setTheme);
 
@@ -66,6 +67,7 @@ export default function HeaderBar() {
         style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-xs)', flex: 1 }}
         aria-label="Main navigation"
       >
+        {selectedModelId && currentView !== 'model-detail' && <button className="return-workspace" onClick={() => useAppStore.getState().navigateToModel(selectedModelId)}>Return to workspace</button>}
         {NAV_TABS.map(({ label, view }) => (
           <button
             key={view}

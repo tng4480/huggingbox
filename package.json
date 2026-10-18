@@ -1,13 +1,15 @@
 {
   "name": "huggingbox",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "node scripts/test.mjs",
+    "test:python": "python3 -m unittest discover -s hf_auto_runner/tests -v"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

@@ -4,14 +4,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../../stores/appStore';
 import type { HFModelDetail } from '../../stores/appStore';
 import { confirmDialog, messageDialog } from '../../services/dialogs';
-import { fetchModelDetail, estimateModelSize, formatBytes, getModelFormatInfo, resolveGgufFile } from '../../services/huggingfaceApi';
+import { estimateModelSize, formatBytes, getModelFormatInfo, resolveGgufFile } from '../../services/huggingfaceApi';
 import { estimateRamBytes } from '../../utils/ramEstimation';
 import {
   buildCacheIdentity,
-  buildFallbackAnalysis,
-  buildFallbackCode,
-  fixCodeWithClaude,
-  generateCodeWithClaude,
+  fixCodeWithAssistant,
+  generateCodeWithAssistant,
   generateCodeLocally,
 } from '../../services/hfAutoRunner';
 import {
@@ -19,6 +17,10 @@ import {
   readCachedCode,
   writeCachedCode,
 } from '../../services/codeCache';
+import { loadModelDetail } from '../../services/modelDetails';
+import { useWorkspaceDraft } from '../../hooks/useWorkspaceDraft';
+import { listModelEnvironments, type ModelEnvironment } from '../../services/modelEnvironments';
+import RunHistory from './RunHistory';
 import ModelInfoPanel from './ModelInfoPanel';
 import CodeEditor from './CodeEditor';
 import FileExplorer from './FileExplorer';
@@ -65,23 +67,26 @@ export default function ModelDetailView() {
     if (!selectedModelId) return;
     if (modelDetail?.id === selectedModelId || modelDetail?.modelId === selectedModelId) return;
 
+    let cancelled = false;
     async function load() {
       setModelDetailLoading(true);
       setModelDetailError(null);
       try {
-        const detail = await fetchModelDetail(
+        const detail = await loadModelDetail(
           selectedModelId!,
+          settings.modelStoragePath,
           settings.hfToken || undefined
         );
-        setModelDetail(detail);
+        if (!cancelled && useAppStore.getState().selectedModelId === selectedModelId) setModelDetail(detail);
       } catch {
-        setModelDetailError("Couldn't load model details. Try again.");
+        if (!cancelled) setModelDetailError("Couldn't load model details. Check your connection or prepare the model before using it offline.");
       } finally {
-        setModelDetailLoading(false);
+        if (!cancelled) setModelDetailLoading(false);
       }
     }
 
-    load();
+    void load();
+    return () => { cancelled = true; };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedModelId]);
 
@@ -100,6 +105,7 @@ export default function ModelDetailView() {
     }
 
     setCodeGenerating(true);
+    await invoke('begin_preparation').catch(() => {});
 
     const modelId = modelDetail.modelId ?? modelDetail.id;
     const ggufFile = resolveGgufFile(modelDetail, useAppStore.getState().selectedGguf)?.name ?? null;
@@ -111,18 +117,20 @@ export default function ModelDetailView() {
     try {
       const cacheKey = await buildCodeCacheKey(cacheIdentity);
       const cached = bypassCache ? null : await readCachedCode(cacheKey);
+      if (useAppStore.getState().selectedModelId !== modelId) return;
       if (cached) {
         setGeneratedCode(cached);
         setCodeSource('cached');
-        setClaudeAnalysis('Loaded cached code. Click Re-gen to refresh Claude analysis for this model.');
+        setClaudeAnalysis('Loaded cached code. Click Re-gen to refresh recipe analysis for this model.');
       } else {
         let code: string;
         try {
-          const usingClaude = settings.codeGenerationProvider === 'claude-sonnet';
+          const usingClaude = settings.codeGenerationProvider !== 'autorunner';
           const generated = usingClaude
-            ? await generateCodeWithClaude(modelDetail, settings, systemInfo)
+            ? await generateCodeWithAssistant(modelDetail, settings, systemInfo)
             : await generateCodeLocally(modelDetail, settings, systemInfo, ggufFile);
           code = generated.code;
+          if (useAppStore.getState().selectedModelId !== modelId) return;
           setClaudeAnalysis(generated.analysis);
           setCodeSource('generated');
 
@@ -130,12 +138,13 @@ export default function ModelDetailView() {
             const missingClaudeDependencies = await invoke<string[]>('check_packages', {
               packages: generated.dependencies,
               modelId,
-              venvModelId: modelId,
+              venvModelId: (useAppStore.getState().workspaceDrafts[modelId]?.environmentId as string) || modelId,
+              envStoragePath: settings.envStoragePath || null,
             });
 
             if (missingClaudeDependencies.length === 0) {
               setClaudeAnalysis(
-                `${generated.analysis}\n\nClaude-suggested dependencies are already installed in this model environment.`
+                `${generated.analysis}\n\nAssistant-suggested dependencies are already installed in this model environment.`
               );
             } else if (settings.claudeAutoInstallDependencies) {
               const approved = await confirmDialog(
@@ -145,43 +154,38 @@ export default function ModelDetailView() {
                 await invoke('install_packages', {
                   packages: missingClaudeDependencies,
                   modelId,
-                  venvModelId: modelId,
+                  venvModelId: (useAppStore.getState().workspaceDrafts[modelId]?.environmentId as string) || modelId,
+              envStoragePath: settings.envStoragePath || null,
                 });
                 setClaudeAnalysis(
-                  `${generated.analysis}\n\nInstalled Claude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
+                  `${generated.analysis}\n\nInstalled Assistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
                 );
               } else {
                 setClaudeAnalysis(
-                  `${generated.analysis}\n\nClaude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
+                  `${generated.analysis}\n\nAssistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
                 );
               }
             } else {
               setClaudeAnalysis(
-                `${generated.analysis}\n\nClaude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
+                `${generated.analysis}\n\nAssistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`
               );
             }
           }
         } catch (err) {
           const providerLabel =
-            settings.codeGenerationProvider === 'claude-sonnet'
-              ? 'Claude Sonnet'
-              : 'hf_auto_runner';
-          console.error(`${providerLabel} generation failed`, err);
-          code = buildFallbackCode(modelDetail);
-          setClaudeAnalysis(buildFallbackAnalysis(modelDetail, systemInfo, String(err)));
-          setCodeSource('generated');
-          setCodeGenerationError(
-            `${providerLabel} failed to generate code. Loaded a local fallback template instead. Error: ${String(err)}`
-          );
+            settings.codeGenerationProvider;
+          throw new Error(`${providerLabel} could not prepare this model: ${String(err)}. No fallback script was substituted.`);
         }
 
+        if (useAppStore.getState().selectedModelId !== modelId) return;
         setGeneratedCode(code);
+        useAppStore.getState().setWorkspaceDraft(modelId, {dirty: true});
         await writeCachedCode(cacheKey, modelId, code);
       }
     } catch (err) {
-      setCodeGenerationError(String(err));
+      if (useAppStore.getState().selectedModelId === modelId) setCodeGenerationError(String(err));
     } finally {
-      setCodeGenerating(false);
+      if (useAppStore.getState().selectedModelId === modelId) setCodeGenerating(false);
     }
   }
 
@@ -189,10 +193,20 @@ export default function ModelDetailView() {
     await generateCode();
   }
 
-  function handleUseModel() {
-    setCodeGenerationError(null);
-    setGeneratedCode('');
-    setCodeSource(null);
+  async function handleUseModel() {
+    if (!modelDetail) return;
+    const id = modelDetail.modelId ?? modelDetail.id;
+    try {
+      const existing = await readModelWorkspaceFile(id, settings.modelStoragePath, 'huggingbox_main.py');
+      if (existing.trim()) {
+        if (useAppStore.getState().selectedModelId !== id) return;
+        setGeneratedCode(existing); setCodeSource('edited');
+        setClaudeAnalysis(existing.includes('hf_auto_runner.local_runtime') ? 'Loaded your saved recipe.' : 'Loaded your existing script unchanged. Use Re-gen to create a managed local recipe; your current script will be backed up.');
+        useAppStore.getState().setWorkspaceDraft(id, {dirty: false});
+        return;
+      }
+    } catch { /* New workspaces need a generated recipe. */ }
+    await generateCode();
   }
 
   async function handleRegenerateCode() {
@@ -201,6 +215,11 @@ export default function ModelDetailView() {
         "You've edited the code. Regenerating will replace your changes. Continue?"
       );
       if (!proceed) return;
+    }
+    if (selectedModelId && generatedCode?.trim()) {
+      try {
+        await writeModelWorkspaceFile(selectedModelId, settings.modelStoragePath, `backups/recipe-${Date.now()}.py`, generatedCode);
+      } catch (error) { setCodeGenerationError(`Could not back up the current script: ${String(error)}`); return; }
     }
     await generateCode({ bypassCache: true });
   }
@@ -217,30 +236,32 @@ export default function ModelDetailView() {
     const missingClaudeDependencies = await invoke<string[]>('check_packages', {
       packages: dependencies,
       modelId,
-      venvModelId: modelId,
+      venvModelId: (useAppStore.getState().workspaceDrafts[modelId]?.environmentId as string) || modelId,
+              envStoragePath: settings.envStoragePath || null,
     });
 
     if (missingClaudeDependencies.length === 0) {
-      return `${analysis}\n\nClaude-suggested dependencies are already installed in this model environment.`;
+      return `${analysis}\n\nAssistant-suggested dependencies are already installed in this model environment.`;
     }
 
     if (!settings.claudeAutoInstallDependencies) {
-      return `${analysis}\n\nClaude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
+      return `${analysis}\n\nAssistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
     }
 
     const approved = await confirmDialog(
       `Claude suggested these Python dependencies for ${modelId}.\n\nAlready installed dependencies were skipped.\n\nMissing dependencies:\n${missingClaudeDependencies.join('\n')}\n\nInstall the missing dependencies into this model environment now?`
     );
     if (!approved) {
-      return `${analysis}\n\nClaude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
+      return `${analysis}\n\nAssistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
     }
 
     await invoke('install_packages', {
       packages: missingClaudeDependencies,
       modelId,
-      venvModelId: modelId,
+      venvModelId: (useAppStore.getState().workspaceDrafts[modelId]?.environmentId as string) || modelId,
+              envStoragePath: settings.envStoragePath || null,
     });
-    return `${analysis}\n\nInstalled Claude-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
+    return `${analysis}\n\nInstalled Assistant-suggested missing dependencies:\n${missingClaudeDependencies.join(', ')}`;
   }
 
   async function handleFixCode() {
@@ -252,8 +273,8 @@ export default function ModelDetailView() {
         ? activeExecutionEnvModelId
         : modelId;
 
-    if (!settings.claudeApiKey.trim()) {
-      setCodeGenerationError('Claude Sonnet fix mode requires an Anthropic API key in Settings.');
+    if (!['codex-cli', 'claude-code'].includes(settings.codeGenerationProvider) && !settings.claudeApiKey.trim()) {
+      setCodeGenerationError('Select Codex CLI or Claude Code in Settings, or supply an Anthropic API key for repair.');
       return;
     }
 
@@ -276,20 +297,21 @@ export default function ModelDetailView() {
         hfToken: settings.hfToken || null,
       });
 
-      const fixed = await fixCodeWithClaude(modelDetail, settings, systemInfo, {
+      const fixed = await fixCodeWithAssistant(modelDetail, settings, systemInfo, {
         currentCode,
         stderrOutput: stderrOutput || freezeResult.stderr || '',
         installedModules: freezeResult.stdout || '',
         executionError,
       });
 
+      if (useAppStore.getState().selectedModelId !== modelId) return;
       setGeneratedCode(fixed.code);
       setCodeSource('generated');
       const enrichedAnalysis = await syncClaudeDependencies(modelId, fixed.dependencies, fixed.analysis);
       setClaudeAnalysis(enrichedAnalysis);
       setCodeGenerationError(null);
     } catch (error) {
-      setCodeGenerationError(`Claude fix failed: ${String(error)}`);
+      setCodeGenerationError(`Assistant repair failed: ${String(error)}`);
     } finally {
       setCodeGenerating(false);
     }
@@ -297,7 +319,7 @@ export default function ModelDetailView() {
 
   const showFixButton =
     generatedCode !== null &&
-    (executionState === 'error' || Boolean(executionError?.trim()) || Boolean(stderrOutput.trim()));
+    (executionState === 'error' || Boolean(executionError?.trim()));
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -343,7 +365,7 @@ export default function ModelDetailView() {
             <Button
               variant="secondary"
               onClick={generatedCode.trim() ? handleRegenerateCode : handleGenerateCode}
-              disabled={codeGenerating}
+              disabled={codeGenerating || Boolean(useAppStore.getState().activeJobId)}
               style={{ fontSize: '12px', height: '28px', padding: '0 var(--space-md)' }}
             >
               {generatedCode.trim() ? 'Re-gen' : 'Generate Code'}
@@ -352,7 +374,7 @@ export default function ModelDetailView() {
               <Button
                 variant="secondary"
                 onClick={handleFixCode}
-                disabled={codeGenerating}
+                disabled={codeGenerating || Boolean(useAppStore.getState().activeJobId)}
                 style={{ fontSize: '12px', height: '28px', padding: '0 var(--space-md)' }}
               >
                 Fix
@@ -424,6 +446,8 @@ export default function ModelDetailView() {
             <ModelInfoPanel
               model={modelDetail}
               onUseModel={handleUseModel}
+              preparing={codeGenerating}
+              busy={Boolean(useAppStore.getState().activeJobId)}
               codeGenerationError={codeGenerationError}
             />
           </div>
@@ -461,35 +485,41 @@ function WorkspaceLayout({
   claudeAnalysis,
   codeGenerationError,
 }: WorkspaceLayoutProps) {
-  const [inputValue, setInputValue] = useState('');
-  const [runMode, setRunMode] = useState<'prepared' | 'direct'>('prepared');
-  const [diffusionMode, setDiffusionMode] = useState<DiffusionMode>('text-to-image');
-  const [sourceImagePath, setSourceImagePath] = useState('');
-  const [maskImagePath, setMaskImagePath] = useState('');
-  const [negativePrompt, setNegativePrompt] = useState('');
-  const [steps, setSteps] = useState(30);
-  const [guidanceScale, setGuidanceScale] = useState(7.5);
-  const [seed, setSeed] = useState('');
-  const [numImages, setNumImages] = useState(1);
-  const [strength, setStrength] = useState(0.75);
-  const [multimodalTask, setMultimodalTask] = useState<MultimodalTask>('visual-question-answering');
-  const [multimodalImagePath, setMultimodalImagePath] = useState('');
-  const [multimodalDocumentPath, setMultimodalDocumentPath] = useState('');
+  const modelId = model.modelId ?? model.id;
+  const activeJobId = useAppStore(s => s.activeJobId);
+  const activeModel = useAppStore(s => s.activeExecutionModelId);
+  const [showAdvanced, setShowAdvanced] = useWorkspaceDraft(modelId, 'advanced', false);
+  const [environmentId, setEnvironmentId] = useWorkspaceDraft(modelId, 'environmentId', '');
+  const [environments, setEnvironments] = useState<ModelEnvironment[]>([]);
+  const [inputValue, setInputValue] = useWorkspaceDraft(modelId, 'inputValue', '');
+  const [runMode, setRunMode] = useWorkspaceDraft<'prepared' | 'direct'>(modelId, 'runMode', 'prepared');
+  const [diffusionMode, setDiffusionMode] = useWorkspaceDraft<DiffusionMode>(modelId, 'diffusionMode', 'text-to-image');
+  const [sourceImagePath, setSourceImagePath] = useWorkspaceDraft(modelId, 'sourceImagePath', '');
+  const [maskImagePath, setMaskImagePath] = useWorkspaceDraft(modelId, 'maskImagePath', '');
+  const [negativePrompt, setNegativePrompt] = useWorkspaceDraft(modelId, 'negativePrompt', '');
+  const [steps, setSteps] = useWorkspaceDraft(modelId, 'steps', 30);
+  const [guidanceScale, setGuidanceScale] = useWorkspaceDraft(modelId, 'guidanceScale', 7.5);
+  const [seed, setSeed] = useWorkspaceDraft(modelId, 'seed', '');
+  const [numImages, setNumImages] = useWorkspaceDraft(modelId, 'numImages', 1);
+  const [strength, setStrength] = useWorkspaceDraft(modelId, 'strength', 0.75);
+  const [multimodalTask, setMultimodalTask] = useWorkspaceDraft<MultimodalTask>(modelId, 'multimodalTask', 'visual-question-answering');
+  const [multimodalImagePath, setMultimodalImagePath] = useWorkspaceDraft(modelId, 'multimodalImagePath', '');
+  const [multimodalDocumentPath, setMultimodalDocumentPath] = useWorkspaceDraft(modelId, 'multimodalDocumentPath', '');
   const [currentDirectory, setCurrentDirectory] = useState('');
   const [workspaceEntries, setWorkspaceEntries] = useState<ModelWorkspaceEntry[]>([]);
   const [workspaceLoading, setWorkspaceLoading] = useState(false);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
-  const [selectedFilePath, setSelectedFilePath] = useState<string | null>(null);
+  const [selectedFilePath, setSelectedFilePath] = useWorkspaceDraft<string | null>(modelId, 'selectedFilePath', null);
   const [editorCode, setEditorCode] = useState(code);
   const [editorStatus, setEditorStatus] = useState('Python');
   const initialCodeRef = useRef(code);
   const skipNextAutosaveRef = useRef(true);
   const previousExecutionStateRef = useRef(executionState);
   const settings = useAppStore((s) => s.settings);
+  useEffect(() => { void listModelEnvironments(settings.envStoragePath).then(setEnvironments).catch(() => {}); }, [modelId, settings.envStoragePath]);
   const setGeneratedCode = useAppStore((s) => s.setGeneratedCode);
   const setCodeSource = useAppStore((s) => s.setCodeSource);
   const { runCode, cancelExecution } = useExecution();
-  const modelId = useMemo(() => model.modelId ?? model.id, [model.id, model.modelId]);
   const supportsDiffusionModes = useMemo(() => {
     const pipeline = (model.pipeline_tag ?? '').toLowerCase();
     if (['text-to-image', 'image-to-image', 'inpainting'].includes(pipeline)) return true;
@@ -507,10 +537,7 @@ function WorkspaceLayout({
     return /(^|\n)\s*#?\s*RUNTIME:\s*transformers_multimodal\b/i.test(editorCode);
   }, [editorCode, model.pipeline_tag]);
 
-  const isRunning =
-    executionState === 'running' ||
-    executionState === 'installing' ||
-    executionState === 'downloading';
+  const isRunning = Boolean(activeJobId && activeModel === modelId);
 
   // Derive metadata labels for InputPanel info section
   const selectedGguf = useAppStore((s) => s.selectedGguf);
@@ -631,11 +658,12 @@ function WorkspaceLayout({
     setEditorStatus('Python');
 
     void (async () => {
-      const defaultFile = 'huggingbox_main.py';
+      const defaultFile = (useAppStore.getState().workspaceDrafts[modelId]?.selectedFilePath as string) || 'huggingbox_main.py';
       try {
         let content: string;
         try {
-          content = await readModelWorkspaceFile(modelId, settings.modelStoragePath, defaultFile);
+          const draft = useAppStore.getState().workspaceDrafts[modelId];
+          content = draft?.dirty ? initialCodeRef.current : await readModelWorkspaceFile(modelId, settings.modelStoragePath, defaultFile);
         } catch {
           content = initialCodeRef.current || '';
           await writeModelWorkspaceFile(modelId, settings.modelStoragePath, defaultFile, content);
@@ -683,6 +711,7 @@ function WorkspaceLayout({
             editorCode
           );
           setEditorStatus('Saved');
+          if (useAppStore.getState().codeByModel[modelId] === editorCode) useAppStore.getState().setWorkspaceDraft(modelId, {dirty: false});
           setTimeout(() => setEditorStatus('Python'), 1000);
         } catch (error) {
           setEditorStatus('Save failed');
@@ -697,9 +726,11 @@ function WorkspaceLayout({
   const handleCodeChange = useCallback(
     (nextCode: string) => {
       setEditorCode(nextCode);
+      setGeneratedCode(nextCode);
+      useAppStore.getState().setWorkspaceDraft(modelId, {dirty: true});
       setCodeSource('edited');
     },
-    [setCodeSource]
+    [setCodeSource, setGeneratedCode, modelId]
   );
 
   const handleOpenDirectory = useCallback(
@@ -788,7 +819,7 @@ function WorkspaceLayout({
     return targetPath;
   }, [editorCode, modelId, selectedFilePath, settings.modelStoragePath]);
 
-  async function handleRun() {
+  async function handleRun(repair = false) {
     const trimmedInput = inputValue.trim();
     if (supportsMultimodalModes) {
       if (multimodalTask === 'visual-question-answering') {
@@ -850,8 +881,11 @@ function WorkspaceLayout({
 
     try {
       const scriptRelativePath = await saveEditorFile();
-      runCode({
+      await runCode({
         modelId,
+        ggufFile: resolveGgufFile(model, selectedGguf)?.name,
+        environmentId: environmentId || undefined,
+        repair,
         storagePath: settings.modelStoragePath,
         hfToken: settings.hfToken,
         pipelineTag: model.pipeline_tag,
@@ -918,7 +952,8 @@ function WorkspaceLayout({
           onNumImagesChange={setNumImages}
           strength={strength}
           onStrengthChange={setStrength}
-          onRun={handleRun}
+          onRun={() => void handleRun()}
+          disabled={Boolean(activeJobId && activeModel !== modelId) || !editorCode.trim()}
           onCancel={cancelExecution}
           isRunning={isRunning}
           modelSize={sizeLabel}
@@ -986,7 +1021,7 @@ function WorkspaceLayout({
                 marginBottom: '6px',
               }}
             >
-              Claude Analysis
+              Recipe analysis
             </div>
             <div
               style={{
@@ -1017,7 +1052,15 @@ function WorkspaceLayout({
             {workspaceError}
           </div>
         )}
-        <div style={{ flex: '0 0 55%', overflow: 'hidden', borderBottom: '1px solid var(--border)' }}>
+        <div className="workspace-actions">
+          <Button onClick={() => setShowAdvanced(v => !v)}>{showAdvanced ? 'Hide code & files' : 'Code & files'}</Button>
+          <Button disabled={Boolean(activeJobId)} onClick={() => void handleRun(true)}>Repair setup &amp; retry</Button>
+          {activeJobId && activeModel !== modelId && <Button onClick={() => useAppStore.getState().navigateToModel(activeModel!)}>Open running model</Button>}
+        </div>
+        {showAdvanced && <div className="environment-picker"><label>Python environment<select value={environmentId} onChange={e => setEnvironmentId(e.target.value)} disabled={Boolean(activeJobId)}>
+          <option value="">Isolated environment for this model</option>{environments.map(e => <option key={e.modelId} value={e.modelId}>{e.modelId}</option>)}
+        </select></label></div>}
+        {showAdvanced && <div className="code-workspace">
           <div style={{ display: 'flex', height: '100%' }}>
             <FileExplorer
               currentDirectory={currentDirectory}
@@ -1049,7 +1092,7 @@ function WorkspaceLayout({
               onCodeChange={handleCodeChange}
             />
           </div>
-        </div>
+        </div>}
         <div style={{ flex: '1 1 auto', overflow: 'hidden' }}>
           <OutputPanel
             modelId={modelId}
@@ -1060,6 +1103,8 @@ function WorkspaceLayout({
             multimodalDocumentPath={supportsMultimodalModes ? multimodalDocumentPath : undefined}
           />
         </div>
+        <div className="workspace-actions"><Button disabled={Boolean(activeJobId)} onClick={() => void invoke('unload_model').catch(error => setWorkspaceError(String(error)))}>Unload model from memory</Button><span>Generated recipes stay loaded between runs.</span></div>
+        <RunHistory />
       </div>
     </div>
   );

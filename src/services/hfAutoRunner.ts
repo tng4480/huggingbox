@@ -100,7 +100,7 @@ async function fetchModelReadme(modelId: string, hfToken?: string): Promise<stri
 
 export function buildCacheIdentity(model: HFModelDetail, system: SystemInfo): string {
   // We use model ID, RAM size, GPU availability, and OS as factors that might affect script output.
-  return `${model.modelId || model.id}_${system.totalRam}_gpu:${system.gpuName ? 'yes' : 'no'}_${system.os}`;
+  return `local-worker-v2_${model.modelId || model.id}_${system.totalRam}_gpu:${system.gpuName ? 'yes' : 'no'}_${system.os}`;
 }
 
 export async function generateCodeLocally(
@@ -110,7 +110,7 @@ export async function generateCodeLocally(
   ggufFile?: string | null
 ): Promise<CodeGenerationResponse> {
   const modelId = model.modelId || model.id;
-  
+
   if (!modelId) {
     throw new Error('Model ID is required to generate code.');
   }
@@ -122,7 +122,7 @@ export async function generateCodeLocally(
       ggufFile: ggufFile ?? null,
       hfToken: settings.hfToken?.trim() ? settings.hfToken.trim() : null,
     });
-    
+
     let parsed: RawGenerationResponse;
     try {
       parsed = parseRunnerResponse(rawResponse);
@@ -148,7 +148,7 @@ export async function generateCodeLocally(
         .join('\n');
       throw new Error(details);
     }
-        
+
     if (!parsed.code || !parsed.analysis) {
       throw new Error(
         `Invalid output received from hf_auto_runner python generator.\nParsed payload preview:\n${previewText(
@@ -156,19 +156,19 @@ export async function generateCodeLocally(
         )}`
       );
     }
-        
+
     return {
       code: parsed.code,
       analysis: parsed.analysis
     };
-    
+
   } catch (error) {
      console.error("Local code generation failed:", error);
      throw new Error(`Could not generate local script: ${error}`);
   }
 }
 
-export async function generateCodeWithClaude(
+export async function generateCodeWithAssistant(
   model: HFModelDetail,
   settings: AppSettings,
   system: SystemInfo
@@ -179,7 +179,7 @@ export async function generateCodeWithClaude(
   if (!modelId) {
     throw new Error('Model ID is required to generate code.');
   }
-  if (!claudeApiKey) {
+  if (!claudeApiKey && !['codex-cli', 'claude-code'].includes(settings.codeGenerationProvider)) {
     throw new Error('Anthropic API key is required for Claude Sonnet generation.');
   }
   try {
@@ -205,7 +205,8 @@ export async function generateCodeWithClaude(
       '',
       'Requirements for the Python script:',
       '- It must be a single file.',
-      '- It must use the provided model id exactly.',
+      '- Use model_source(model_id) from hf_auto_runner.local_runtime for local weights and load_once(loader, ...) for reusable model objects.',
+    '- All downloads are prepared separately; do not download weights in the generated script.',
       '- It must read user input from environment variable HB_INPUT.',
       '- HB_INPUT contains the user-provided input from the app and should be treated as the primary runtime input contract.',
       '- For text models, HB_INPUT is plain text.',
@@ -240,7 +241,7 @@ export async function generateCodeWithClaude(
       readme || '(README not available)',
     ].join('\n');
 
-    const payload = await invoke<AnthropicMessagesResponse>('generate_code_with_claude', {
+    const payload = await requestAssistant(settings, {
       model: CLAUDE_SONNET_MODEL,
       apiKey: claudeApiKey,
       prompt,
@@ -248,13 +249,13 @@ export async function generateCodeWithClaude(
     const text = payload.text?.trim() ?? '';
 
     if (!text) {
-      throw new Error('Anthropic API returned no text content.');
+      throw new Error('Assistant returned no text content.');
     }
 
     const parsed = parseRunnerResponse(text);
     if (!parsed.code || !parsed.analysis) {
       throw new Error(
-        `Claude Sonnet returned an invalid payload.\nPayload preview:\n${previewText(text)}`
+        `Assistant returned an invalid payload.\nPayload preview:\n${previewText(text)}`
       );
     }
 
@@ -272,7 +273,7 @@ export async function generateCodeWithClaude(
   }
 }
 
-export async function fixCodeWithClaude(
+export async function fixCodeWithAssistant(
   model: HFModelDetail,
   settings: AppSettings,
   system: SystemInfo,
@@ -284,7 +285,7 @@ export async function fixCodeWithClaude(
   if (!modelId) {
     throw new Error('Model ID is required to fix code.');
   }
-  if (!claudeApiKey) {
+  if (!claudeApiKey && !['codex-cli', 'claude-code'].includes(settings.codeGenerationProvider)) {
     throw new Error('Anthropic API key is required for Claude Sonnet fix mode.');
   }
 
@@ -300,7 +301,7 @@ export async function fixCodeWithClaude(
 
   const prompt = [
     'Fix the current HuggingBox Python script using the runtime failure context below.',
-    'You must use web search before answering to verify the model-specific runtime, dependency requirements, and input format.',
+    'Use the supplied model documentation to verify runtime, dependency requirements and input format. State uncertainty explicitly.',
     '',
     'Return strict JSON only with this exact shape:',
     '{',
@@ -311,8 +312,9 @@ export async function fixCodeWithClaude(
     '',
     'Requirements for the corrected Python script:',
     '- It must be a single file.',
-    '- It must use the provided model id exactly.',
-    '- Preserve HuggingBox environment contracts.',
+    '- Use model_source(model_id) from hf_auto_runner.local_runtime for local weights and load_once(loader, ...) for reusable model objects.',
+    '- All downloads are prepared separately; do not download weights in the generated script.',
+    '- Preserve HuggingBox environment contracts. Use HB_MODEL_DIR for local weights; never silently download another copy.',
     '- HB_INPUT is the primary text/runtime input contract unless the model is multimodal.',
     '- For Sprint 8 multimodal code, use HB_INPUT for text only, HB_IMAGE_PATH for uploaded images, HB_DOCUMENT_PATH for uploaded document images or PDFs, and HB_MULTIMODAL_TASK for the selected multimodal task.',
     '- It must read HF_TOKEN from the environment when available, but fall back to no token if missing.',
@@ -346,7 +348,7 @@ export async function fixCodeWithClaude(
     readme || '(README not available)',
   ].join('\n');
 
-  const payload = await invoke<AnthropicMessagesResponse>('generate_code_with_claude', {
+  const payload = await requestAssistant(settings, {
     model: CLAUDE_SONNET_MODEL,
     apiKey: claudeApiKey,
     prompt,
@@ -354,13 +356,13 @@ export async function fixCodeWithClaude(
   const text = payload.text?.trim() ?? '';
 
   if (!text) {
-    throw new Error('Anthropic API returned no text content.');
+    throw new Error('Assistant returned no text content.');
   }
 
   const parsed = parseRunnerResponse(text);
   if (!parsed.code || !parsed.analysis) {
     throw new Error(
-      `Claude Sonnet returned an invalid fix payload.\nPayload preview:\n${previewText(text)}`
+      `Assistant returned an invalid fix payload.\nPayload preview:\n${previewText(text)}`
     );
   }
 
@@ -375,69 +377,17 @@ export async function fixCodeWithClaude(
   };
 }
 
-export function buildFallbackCode(model: HFModelDetail): string {
-  const modelId = model.modelId || model.id;
-
-  return `# HuggingBox fallback template (transformers)
-import torch
-from transformers import pipeline
-
-print(f"Loading generic fallback pipeline for ${modelId}...")
-try:
-    pipe = pipeline(model="${modelId}", device=0 if torch.cuda.is_available() else -1)
-    print(f"Pipeline created.")
-    print("Due to lack of metadata, automatic inference cannot deduce input type.")
-    print("Pass appropriate inputs directly.")
-except Exception as e:
-    print(f"Failed to initialize generic pipeline: {e}")
-    raise
-`;
-}
-
-function summarizeError(errorText: string): string {
-  const compact = errorText.replace(/\r/g, '').trim();
-  if (!compact) return 'No additional runner diagnostics were captured.';
-
-  const lines = compact
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const picked: string[] = [];
-  for (const line of lines) {
-    if (
-      /hf_auto_runner execution failed/i.test(line) ||
-      /^Type:/i.test(line) ||
-      /^Exit:/i.test(line) ||
-      /^Failed to fetch model info/i.test(line) ||
-      /^Runner output is not valid JSON/i.test(line) ||
-      /^Invalid output received/i.test(line) ||
-      /Unauthorized|401|403|gated|Repository Not Found|not found/i.test(line)
-    ) {
-      picked.push(line);
+async function requestAssistant(settings: AppSettings, request: {model: string; apiKey: string; prompt: string}): Promise<AnthropicMessagesResponse> {
+  if (settings.codeGenerationProvider === 'codex-cli' || settings.codeGenerationProvider === 'claude-code') {
+    let prompt = request.prompt;
+    for (const secret of [settings.hfToken, settings.claudeApiKey]) {
+      if (secret?.trim()) prompt = prompt.split(secret).join('[REDACTED]');
     }
-    if (picked.length >= 6) break;
+    return invoke('generate_code_with_cli', {
+      provider: settings.codeGenerationProvider,
+      executablePath: (settings.codeGenerationProvider === 'codex-cli' ? settings.codexCliPath : settings.claudeCodePath) || null,
+      prompt,
+    });
   }
-
-  const source = picked.length > 0 ? picked : lines.slice(0, 6);
-  const joined = source.join('\n');
-  return joined.length > 1200 ? `${joined.slice(0, 1200)}\n...[truncated]` : joined;
-}
-
-export function buildFallbackAnalysis(
-  model: HFModelDetail,
-  system: SystemInfo,
-  errorText?: string
-): string {
-  const modelId = model.modelId || model.id;
-  const ramGb = (system.totalRam / (1024 ** 3)).toFixed(1);
-  const gpu = system.gpuName ? `${system.gpuName} (${system.gpuVram}GB)` : 'None';
-  const diagnostics = summarizeError(errorText ?? '');
-
-  return `Model ${modelId} could not be successfully parsed by the runner.
-Detected hardware: ${ramGb} GB RAM; GPU: ${gpu}. Prefer CUDA when available, otherwise CPU fallback is used.
-This is a generic transformers fallback configuration and may not execute successfully natively.
-
-Runner diagnostics:
-${diagnostics}`;
+  return invoke('generate_code_with_claude', request);
 }

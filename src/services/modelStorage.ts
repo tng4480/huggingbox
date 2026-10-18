@@ -26,6 +26,7 @@ export async function listDownloadedModels(storagePath: string): Promise<Downloa
 }
 
 export async function deleteDownloadedModel(modelId: string, storagePath: string): Promise<void> {
+  await invoke('unload_model');
   await invoke('delete_downloaded_model', {
     modelId,
     storagePath,

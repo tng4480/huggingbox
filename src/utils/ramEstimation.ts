@@ -24,7 +24,7 @@ const RAM_MULTIPLIERS: Record<string, number> = {
   'image-to-image': 0,
 };
 
-const DIFFUSION_FLAT_GB = 8 * 1024 ** 3; // 8 GB flat for diffusion models
+
 
 export function estimateRamBytes(model: HFModel, selectedGguf?: string | null): number {
   const tag = model.pipeline_tag ?? '';
@@ -32,7 +32,7 @@ export function estimateRamBytes(model: HFModel, selectedGguf?: string | null): 
 
   // Diffusion models: flat estimate
   if (tag === 'text-to-image' || tag === 'image-to-image') {
-    return DIFFUSION_FLAT_GB;
+    return sizeBytes > 0 ? sizeBytes * 2 + 2 * 1024 ** 3 : 0;
   }
 
   // GGUF weights are memory-mapped at roughly their file size plus a small

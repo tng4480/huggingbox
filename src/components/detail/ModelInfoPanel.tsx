@@ -17,11 +17,13 @@ import { estimateRamBytes, getCompatibility } from '../../utils/ramEstimation';
 interface ModelInfoPanelProps {
   model: HFModelDetail;
   onUseModel: () => void;
+  preparing?: boolean;
+  busy?: boolean;
   codeGenerationError?: string | null;
 }
 
 const COMPAT_CONFIG = {
-  compatible: { color: 'var(--success)', dot: 'var(--success)', label: 'Compatible with your device' },
+  compatible: { color: 'var(--success)', dot: 'var(--success)', label: 'Estimated to fit in RAM — runtime not yet verified' },
   tight: { color: 'var(--warning)', dot: 'var(--warning)', label: 'May be tight — close other apps' },
   'too-large': { color: 'var(--error)', dot: 'var(--error)', label: 'Too large for your device' },
   unknown: { color: 'var(--text-muted)', dot: 'var(--text-muted)', label: 'Compatibility unknown' },
@@ -32,6 +34,8 @@ const MAX_DESC = 300;
 export default function ModelInfoPanel({
   model,
   onUseModel,
+  preparing = false,
+  busy = false,
   codeGenerationError,
 }: ModelInfoPanelProps) {
   const [descExpanded, setDescExpanded] = useState(false);
@@ -294,9 +298,10 @@ export default function ModelInfoPanel({
         <Button
           variant="primary"
           onClick={onUseModel}
+          disabled={preparing || busy}
           style={{ minWidth: '200px', justifyContent: 'center', height: '44px', fontSize: '14px' }}
         >
-          Use This Model
+          {preparing ? 'Preparing recipe…' : 'Open workspace'}
         </Button>
 
         {codeGenerationError && (

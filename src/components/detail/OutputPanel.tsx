@@ -43,11 +43,11 @@ export default function OutputPanel({
   multimodalImagePath,
   multimodalDocumentPath,
 }: OutputPanelProps) {
-  const executionOutput = useAppStore((s) => s.executionOutput);
-  const stderrOutput = useAppStore((s) => s.stderrOutput);
-  const executionState = useAppStore((s) => s.executionState);
-  const executionError = useAppStore((s) => s.executionError);
-  const downloadStats = useAppStore((s) => s.downloadStats);
+  const executionOutput = useAppStore((s) => s.activeExecutionModelId === modelId ? s.executionOutput : '');
+  const stderrOutput = useAppStore((s) => s.activeExecutionModelId === modelId ? s.stderrOutput : '');
+  const executionState = useAppStore((s) => s.activeExecutionModelId === modelId ? s.executionState : 'idle');
+  const executionError = useAppStore((s) => s.activeExecutionModelId === modelId ? s.executionError : null);
+  const downloadStats = useAppStore((s) => s.activeExecutionModelId === modelId ? s.downloadStats : null);
   const executionStats = useAppStore((s) => s.executionStats);
   const settings = useAppStore((s) => s.settings);
   const activeExecutionModelId = useAppStore((s) => s.activeExecutionModelId);

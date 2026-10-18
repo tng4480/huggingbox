@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex, OnceLock};
+mod assistant_cli;
+use std::sync::{Arc, Mutex};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::process::Stdio;
 use std::path::PathBuf;
@@ -7,15 +10,15 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessesToUpdate, System};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-const HF_TRANSFORMERS_GIT_URL: &str = "git+https://github.com/huggingface/transformers.git";
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
+#[cfg(target_os = "windows")]
 static GPU_INFO_CACHE: OnceLock<Option<(String, u64)>> = OnceLock::new();
 
 #[cfg(target_os = "windows")]
@@ -36,16 +39,30 @@ fn apply_no_window_tokio(_command: &mut tokio::process::Command) {}
 
 // ─── Managed State ────────────────────────────────────────────────────────────
 
+pub struct WarmWorker {
+    key: String,
+    pid: u32,
+    stdin: tokio::process::ChildStdin,
+}
+
 pub struct ExecutionHandle {
+    pub worker: Arc<tokio::sync::Mutex<Option<WarmWorker>>>,
+    pub execution_job: Arc<Mutex<Option<String>>>,
     pub execution_pid: Arc<Mutex<Option<u32>>>,
     pub download_pid: Arc<Mutex<Option<u32>>>,
+    pub preparation_pid: Arc<Mutex<Option<u32>>>,
+    pub preparation_cancelled: Arc<AtomicBool>,
 }
 
 impl ExecutionHandle {
     pub fn new() -> Self {
         Self {
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
+            execution_job: Arc::new(Mutex::new(None)),
             execution_pid: Arc::new(Mutex::new(None)),
             download_pid: Arc::new(Mutex::new(None)),
+            preparation_pid: Arc::new(Mutex::new(None)),
+            preparation_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -245,6 +262,8 @@ struct AppSettingsPayload {
     selected_gpu_id: Option<String>,
     #[serde(default)]
     code_generation_provider: String,
+    codex_cli_path: Option<String>,
+    claude_code_path: Option<String>,
     #[serde(default)]
     claude_auto_install_dependencies: bool,
     theme: String,
@@ -278,7 +297,7 @@ fn validate_model_id(model_id: &str) -> Result<(), String> {
     if model_id.trim().is_empty() {
         return Err("Model id is required.".to_string());
     }
-    if model_id.contains("..") || model_id.contains('\\') || model_id.starts_with('/') {
+    if model_id.contains("..") || model_id.contains('\\') || model_id.contains(':') || model_id.starts_with('/') || model_id.split('/').any(|part| part.is_empty()) {
         return Err("Invalid model id path.".to_string());
     }
     Ok(())
@@ -413,20 +432,6 @@ fn resolve_ffmpeg_path(app: &AppHandle) -> Option<String> {
     None
 }
 
-fn model_venv_dir(app: &AppHandle, model_id: &str) -> Result<PathBuf, String> {
-    validate_model_id(model_id)?;
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data dir: {}", e))?;
-    let mut dir = data_dir.join("venvs");
-    for segment in model_id.split('/') {
-        if !segment.trim().is_empty() {
-            dir.push(segment.trim());
-        }
-    }
-    Ok(dir)
-}
 
 fn model_venv_dir_from_root(root: &PathBuf, model_id: &str) -> Result<PathBuf, String> {
     validate_model_id(model_id)?;
@@ -450,10 +455,6 @@ fn venv_python_path(venv_dir: &PathBuf) -> PathBuf {
     }
 }
 
-async fn ensure_model_venv_python(app: &AppHandle, model_id: &str) -> Result<String, String> {
-    let venv_dir = model_venv_dir(app, model_id)?;
-    ensure_venv_python_at_dir(app, &venv_dir).await
-}
 
 async fn ensure_venv_python_at_dir(app: &AppHandle, venv_dir: &PathBuf) -> Result<String, String> {
     let python_path = venv_python_path(&venv_dir);
@@ -512,13 +513,11 @@ async fn ensure_venv_python_at_dir(app: &AppHandle, venv_dir: &PathBuf) -> Resul
     Ok(python_path.to_string_lossy().to_string())
 }
 
-async fn resolve_python(app: &AppHandle, model_id: Option<&str>) -> Result<String, String> {
-    if let Some(id) = model_id {
-        if !id.trim().is_empty() {
-            return ensure_model_venv_python(app, id).await;
-        }
-    }
-    find_python(app).await
+
+async fn resolve_python_in(app: &AppHandle, model_id: &str, root: Option<&str>) -> Result<String, String> {
+    let root = effective_venv_root(app, root)?;
+    let directory = model_venv_dir_from_root(&root, model_id)?;
+    ensure_venv_python_at_dir(app, &directory).await
 }
 
 /// Returns the root directory under which per-model venvs are stored.
@@ -573,6 +572,70 @@ fn normalize_relative_workspace_path(input: &str) -> Result<String, String> {
     Ok(normalized_segments.join("/"))
 }
 
+fn model_cache_dir(storage_path: &str, model_id: &str) -> Result<PathBuf, String> {
+    validate_model_id(model_id)?;
+    let root = PathBuf::from(expand_home_dir(storage_path));
+    let model = model_dir_from_id(storage_path, model_id);
+    if root.exists() {
+        let boundary = root.canonicalize().map_err(|e| e.to_string())?;
+        let mut ancestor = model.as_path();
+        while !ancestor.exists() { ancestor = ancestor.parent().ok_or("Invalid cache path")?; }
+        if !ancestor.canonicalize().map_err(|e| e.to_string())?.starts_with(boundary) { return Err("Model cache escapes the storage directory.".into()); }
+    }
+    let cache = model.join(".weights");
+    if cache.is_symlink() { return Err("Refusing to use a linked model cache.".into()); }
+    Ok(cache)
+}
+
+fn cache_ready(path: &std::path::Path, runtime: Option<&str>, gguf: Option<&str>) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path.join(".huggingbox_complete")) else { return false; };
+    let Ok(record) = serde_json::from_str::<serde_json::Value>(&raw) else { return false; };
+    if record["schema"].as_u64() != Some(1) || runtime.is_some_and(|r| record["runtime"].as_str() != Some(r)) || gguf.is_some_and(|g| record["gguf"].as_str() != Some(g)) { return false; }
+    let Some(files) = record["files"].as_array().filter(|f| !f.is_empty()) else { return false; };
+    files.iter().all(|file| {
+        let Some(name) = file["path"].as_str() else { return false; };
+        let Ok(relative) = normalize_relative_workspace_path(name) else { return false; };
+        let candidate = path.join(relative);
+        let inside = candidate.canonicalize().ok().zip(path.canonicalize().ok()).is_some_and(|(f, root)| f.starts_with(root));
+        inside && candidate.metadata().ok().is_some_and(|m| m.is_file() && Some(m.len()) == file["size"].as_u64())
+    })
+}
+
+#[tauri::command]
+fn read_model_metadata(model_id: String, storage_path: String) -> Result<serde_json::Value, String> {
+    let path = model_cache_dir(&storage_path, &model_id)?.join("huggingbox-model.json");
+    serde_json::from_str(&std::fs::read_to_string(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn environment_fingerprint(app: AppHandle, model_id: String, env_storage_path: Option<String>) -> Result<String, String> {
+    let root = model_venv_dir_from_root(&effective_venv_root(&app, env_storage_path.as_deref())?, &model_id)?;
+    if !venv_python_path(&root).is_file() { return Ok("missing".into()); }
+    let mut paths = vec![root.join("pyvenv.cfg"), root.join("Lib").join("site-packages")];
+    if let Ok(entries) = std::fs::read_dir(root.join("lib")) {
+        for entry in entries.flatten() { paths.push(entry.path().join("site-packages")); }
+    }
+    Ok(format!("{}:{:?}", root.display(), paths.iter().map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok()).collect::<Vec<_>>()))
+}
+
+#[tauri::command]
+fn begin_preparation(handle: State<'_, ExecutionHandle>) {
+    handle.preparation_cancelled.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+fn cancel_preparation(handle: State<'_, ExecutionHandle>) {
+    handle.preparation_cancelled.store(true, Ordering::SeqCst);
+    if let Some(pid) = *handle.preparation_pid.lock().unwrap() { kill_pid(pid, true); }
+}
+
+fn emit_job<T: Serialize>(app: &AppHandle, event: &str, job_id: &str, payload: T) {
+    if let Ok(mut value) = serde_json::to_value(payload) {
+        if let Some(obj) = value.as_object_mut() { obj.insert("job_id".into(), job_id.into()); }
+        let _ = app.emit(event, value);
+    }
+}
+
 fn resolve_model_workspace_root(model_id: &str, storage_path: &str) -> Result<PathBuf, String> {
     validate_model_id(model_id)?;
     let root = model_dir_from_id(storage_path, model_id);
@@ -583,6 +646,7 @@ fn resolve_model_workspace_root(model_id: &str, storage_path: &str) -> Result<Pa
 
 fn resolve_model_workspace_path(root: &PathBuf, relative: &str) -> Result<PathBuf, String> {
     let normalized = normalize_relative_workspace_path(relative)?;
+    if normalized.split('/').next() == Some(".weights") { return Err("Model weights are read-only in the workspace. Use model preparation to manage them.".into()); }
     let mut out = root.clone();
     if !normalized.is_empty() {
         for seg in normalized.split('/') {
@@ -660,15 +724,16 @@ fn discover_model_envs(
 }
 
 fn discover_models(root: &PathBuf, current: &PathBuf, acc: &mut Vec<DownloadedModelPayload>) {
-    let marker = current.join(".huggingbox_complete");
-    if marker.exists() {
+    let cache = current.join(".weights");
+    let marker = cache.join(".huggingbox_complete");
+    if cache_ready(&cache, None, None) {
         if let Ok(rel) = current.strip_prefix(root) {
             let id = rel
                 .iter()
                 .map(|s| s.to_string_lossy().to_string())
                 .collect::<Vec<_>>()
                 .join("/");
-            let size_bytes = compute_dir_size(current);
+            let size_bytes = compute_dir_size(&cache);
             let last_used = std::fs::metadata(&marker)
                 .and_then(|m| m.modified())
                 .ok()
@@ -678,7 +743,7 @@ fn discover_models(root: &PathBuf, current: &PathBuf, acc: &mut Vec<DownloadedMo
             acc.push(DownloadedModelPayload {
                 id: id.clone(),
                 name: id,
-                pipeline_tag: "unknown".to_string(),
+                pipeline_tag: std::fs::read_to_string(cache.join("huggingbox-model.json")).ok().and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok()).and_then(|v| v["pipeline_tag"].as_str().map(str::to_string)).unwrap_or_else(|| "unknown".to_string()),
                 size_bytes,
                 last_used,
                 storage_path: current.to_string_lossy().to_string(),
@@ -690,7 +755,7 @@ fn discover_models(root: &PathBuf, current: &PathBuf, acc: &mut Vec<DownloadedMo
     if let Ok(entries) = std::fs::read_dir(current) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
+            if p.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
                 discover_models(root, &p, acc);
             }
         }
@@ -1132,11 +1197,19 @@ async fn detect_python(app: AppHandle) -> PythonInfo {
 #[tauri::command]
 async fn generate_python_code_local(
     app: AppHandle,
+    handle: State<'_, ExecutionHandle>,
     model_id: String,
     hf_token: Option<String>,
     gguf_file: Option<String>,
 ) -> Result<String, String> {
-    let python = find_python(&app).await?;
+    let runner_root = app.path().app_data_dir().map_err(|e| e.to_string())?.join("runner-env");
+    let python = ensure_venv_python_at_dir(&app, &runner_root).await?;
+    let mut check = tokio::process::Command::new(&python);
+    apply_no_window_tokio(&mut check);
+    let available = check.args(["-c", "import huggingface_hub"]).output().await.map(|o| o.status.success()).unwrap_or(false);
+    if !available {
+        run_pip_install_with_progress(&app, &python, vec!["-m".into(), "pip".into(), "install".into(), "huggingface_hub>=0.34,<2".into()], &handle).await?;
+    }
     let mut cmd = tokio::process::Command::new(&python);
     apply_no_window_tokio(&mut cmd);
     cmd.env("HB_DEBUG", "1");
@@ -1329,6 +1402,7 @@ async fn generate_code_with_claude(
 async fn run_python_code(
     app: AppHandle,
     handle: State<'_, ExecutionHandle>,
+    job_id: String,
     preferred_device: Option<String>,
     selected_gpu_id: Option<String>,
     model_id: Option<String>,
@@ -1352,6 +1426,8 @@ async fn run_python_code(
     image_path: Option<String>,
     document_path: Option<String>,
 ) -> Result<(), String> {
+    if job_id.is_empty() || job_id.len() > 80 || !job_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') { return Err("Invalid job id.".into()); }
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Run cancelled.".into()); }
     {
         let lock = handle.execution_pid.lock().unwrap();
         if lock.is_some() {
@@ -1368,7 +1444,7 @@ async fn run_python_code(
         validate_model_id(env_model)?;
     }
 
-    let python = resolve_python(&app, execution_env_model.as_deref()).await?;
+    let python = resolve_python_in(&app, execution_env_model.as_deref().unwrap_or("default"), env_storage_path.as_deref()).await?;
 
     let mut command = tokio::process::Command::new(&python);
     apply_no_window_tokio(&mut command);
@@ -1433,6 +1509,7 @@ async fn run_python_code(
     }
 
     let device = preferred_device.unwrap_or_else(|| "auto".to_string()).to_lowercase();
+    command.env("HB_DEVICE", &device);
     if device == "cpu" {
         command.env("CUDA_VISIBLE_DEVICES", "-1");
     } else if let Some(gpu_id) = selected_gpu_id.as_deref() {
@@ -1445,6 +1522,12 @@ async fn run_python_code(
     let model = model_id.unwrap_or_else(|| "".to_string());
     if model.is_empty() {
         return Err("Model ID is required for execution via hf_auto_runner.".to_string());
+    }
+
+    if let Some(ref storage) = storage_path {
+        let cache = model_cache_dir(storage, &model)?;
+        command.env("HB_MODEL_DIR", &cache);
+        command.env("HF_HUB_OFFLINE", "1").env("TRANSFORMERS_OFFLINE", "1");
     }
 
     let trimmed_script_relative = script_relative_path
@@ -1519,7 +1602,7 @@ async fn run_python_code(
 
     let resolved_output_dir = if let Some(custom) = output_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if let Some(root) = &workspace_root {
-            let path = resolve_model_workspace_path(root, custom)?;
+            let path = resolve_model_workspace_path(root, custom)?.join(&job_id);
             std::fs::create_dir_all(&path)
                 .map_err(|e| format!("Failed to create output directory: {}", e))?;
             Some(path)
@@ -1530,7 +1613,7 @@ async fn run_python_code(
             Some(path)
         }
     } else if let Some(root) = &workspace_root {
-        let path = root.join("outputs");
+        let path = root.join("outputs").join(&job_id);
         std::fs::create_dir_all(&path)
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
         Some(path)
@@ -1552,27 +1635,7 @@ async fn run_python_code(
         None
     };
 
-    let run_args = if let Some(script_path) = &run_target_path {
-        vec![script_path.to_string_lossy().to_string()]
-    } else {
-        let mut args = vec![
-            "-m".to_string(), "hf_auto_runner".to_string(), "run".to_string(), model.clone()
-        ];
-        if let Some(ref token) = hf_token {
-            if !token.is_empty() {
-                args.push("--hf-token".to_string());
-                args.push(token.clone());
-            }
-        }
-        if let Some(ref input) = user_input {
-            if !input.is_empty() {
-                args.push("--input".to_string());
-                args.push(input.clone());
-            }
-        }
-        args
-    };
-
+    let script_path = run_target_path.ok_or("A workspace script is required.")?;
     let input_kind = if let Some(ref input) = user_input {
         if input.starts_with("__HBIMG__:") || input.starts_with("data:image/") {
             "image"
@@ -1587,7 +1650,7 @@ async fn run_python_code(
         "none"
     };
 
-    let _ = app.emit("execution-stdout", StreamPayload {
+    let _ = emit_job(&app, "execution-stdout", &job_id, StreamPayload {
         text: format!(
             "[HuggingBox] Launching model execution\n  model: {}\n  env: {}\n  python: {}\n  device: {}\n  input: {}\n  ffmpeg: {}\n",
             model,
@@ -1600,131 +1663,103 @@ async fn run_python_code(
     });
     if let Some(path) = env_storage_path.as_deref() {
         if !path.trim().is_empty() {
-            let _ = app.emit("execution-stdout", StreamPayload {
+            let _ = emit_job(&app, "execution-stdout", &job_id, StreamPayload {
                 text: format!("[HuggingBox] Environment storage path: {}\n", path),
             });
         }
     }
-    if let Some(script_path) = &run_target_path {
-        let _ = app.emit("execution-stdout", StreamPayload {
-            text: format!(
-                "[HuggingBox] Executing visible editor file\n  workspace: {}\n  script: {}\n",
-                workspace_root
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "<unknown>".to_string()),
-                script_path.to_string_lossy()
-            ),
-        });
-    }
-    let _ = app.emit("execution-stdout", StreamPayload {
-        text: format!("[HuggingBox] Runner command args: {:?}\n", run_args),
-    });
-
     if let Some(root) = &workspace_root {
         command.current_dir(root);
     }
 
-    let mut child = command
-        .args(&run_args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to start Python: {}", e))?;
-
-    let started_at = std::time::Instant::now();
-
-    // Store PID for cancellation
-    let pid_arc = handle.execution_pid.clone();
-    let child_pid = child.id();
-    {
-        let mut lock = pid_arc.lock().unwrap();
-        *lock = child_pid;
+    let script_text = std::fs::read_to_string(&script_path).map_err(|e| e.to_string())?;
+    let model_revision = storage_path.as_ref().and_then(|storage| model_cache_dir(storage, &model).ok())
+        .and_then(|p| std::fs::read_to_string(p.join(".huggingbox_complete")).ok()).unwrap_or_default();
+    let key = format!("{}:{}:{}:{}:{}:{}:{}", python, script_path.display(), script_text, model_revision, device, selected_gpu_id.unwrap_or_default(), execution_env_model.unwrap_or_default());
+    let env: std::collections::HashMap<String, String> = command.as_std().get_envs()
+        .filter_map(|(k,v)| v.map(|v| (k.to_string_lossy().to_string(), v.to_string_lossy().to_string()))).collect();
+    let mut worker = handle.worker.lock().await;
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Run cancelled.".into()); }
+    if handle.execution_pid.lock().unwrap().is_some() { return Err("Another run started while preparing. Wait for it to finish.".into()); }
+    if worker.as_ref().is_some_and(|w| w.key != key) {
+        if let Some(old) = worker.take() { kill_pid(old.pid, true); }
     }
-
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let stderr = child.stderr.take().ok_or("no stderr")?;
-
-    let app_clone = app.clone();
-
-    // Detach all I/O + wait logic into a background task so the command returns immediately
-    tokio::spawn(async move {
-        let app_out = app_clone.clone();
-        let app_err = app_clone.clone();
-        let app_done = app_clone.clone();
-        let app_stats = app_clone.clone();
-        let pid_for_stats = child_pid;
-        let stats_started_at = started_at;
-
-        let t_stats = tokio::spawn(async move {
-            if let Some(pid_raw) = pid_for_stats {
-                let pid = sysinfo::Pid::from_u32(pid_raw);
-                let mut system = System::new_all();
-                loop {
-                    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-                    if let Some(process) = system.process(pid) {
-                        let _ = app_stats.emit("execution-stats", ExecutionStatsPayload {
-                            pid: pid_raw,
-                            rss_bytes: process.memory(),
-                            virtual_memory_bytes: process.virtual_memory(),
-                            gpu_memory_bytes: None,
-                            elapsed_ms: stats_started_at.elapsed().as_millis() as u64,
-                        });
-                    } else {
-                        break;
+    if worker.is_none() {
+        command.args(["-u", "-m", "hf_auto_runner.worker"]);
+        let mut child = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| e.to_string())?;
+        let pid = child.id().ok_or("Worker has no process id")?;
+        let stdin = child.stdin.take().ok_or("Worker input missing")?;
+        let stdout = child.stdout.take().ok_or("Worker output missing")?;
+        let stderr = child.stderr.take().ok_or("Worker error output missing")?;
+        *worker = Some(WarmWorker {key, pid, stdin});
+        let workers = handle.worker.clone();
+        let execution_pid = handle.execution_pid.clone();
+        let execution_job = handle.execution_job.clone();
+        let app_worker = app.clone();
+        tokio::spawn(async move {
+            let app_out = app_worker.clone(); let jobs_out = execution_job.clone(); let pids_out = execution_pid.clone();
+            let read_out = tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
+                        let id = event["job_id"].as_str().unwrap_or("");
+                        match event["kind"].as_str() {
+                            Some("done") => {
+                                let mut active = jobs_out.lock().unwrap();
+                                if active.as_deref() == Some(id) { *active = None; *pids_out.lock().unwrap() = None; }
+                                let process_id = sysinfo::Pid::from_u32(pid);
+                                let mut system = System::new();
+                                system.refresh_processes(ProcessesToUpdate::Some(&[process_id]), true);
+                                if let Some(process) = system.process(process_id) {
+                                    emit_job(&app_out, "execution-stats", id, ExecutionStatsPayload {pid, rss_bytes: process.memory(), virtual_memory_bytes: process.virtual_memory(), gpu_memory_bytes: None, elapsed_ms: event["elapsed_ms"].as_u64().unwrap_or(0)});
+                                }
+                                emit_job(&app_out, "execution-done", id, DonePayload {exit_code: event["exit_code"].as_i64().unwrap_or(1) as i32});
+                            },
+                            Some(kind @ ("stdout" | "stderr")) => emit_job(&app_out, &format!("execution-{}", kind), id, StreamPayload {text: event["text"].as_str().unwrap_or("").to_string()}),
+                            _ => {},
+                        }
+                    } else if let Some(id) = jobs_out.lock().unwrap().clone() {
+                        emit_job(&app_out, "execution-stdout", &id, StreamPayload {text: line + "\n"});
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                 }
+            });
+            let app_err = app_worker.clone(); let jobs_err = execution_job.clone();
+            let read_err = tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(id) = jobs_err.lock().unwrap().clone() { emit_job(&app_err, "execution-stderr", &id, StreamPayload {text: line + "\n"}); }
+                }
+            });
+            let _ = child.wait().await;
+            let _ = tokio::join!(read_out, read_err);
+            let mut slot = workers.lock().await;
+            if slot.as_ref().is_some_and(|w| w.pid == pid) {
+                *slot = None;
+                *execution_pid.lock().unwrap() = None;
+                if let Some(id) = execution_job.lock().unwrap().take() { emit_job(&app_worker, "execution-done", &id, DonePayload {exit_code: 1}); }
             }
         });
+    }
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Run cancelled.".into()); }
+    let current = worker.as_mut().ok_or("Worker unavailable")?;
+    *handle.execution_job.lock().unwrap() = Some(job_id.clone());
+    *handle.execution_pid.lock().unwrap() = Some(current.pid);
+    let request = serde_json::json!({"job_id": job_id, "script": script_path, "env": env});
+    if let Err(error) = current.stdin.write_all(format!("{}\n", request).as_bytes()).await {
+        kill_pid(current.pid, true);
+        *worker = None;
+        *handle.execution_job.lock().unwrap() = None;
+        *handle.execution_pid.lock().unwrap() = None;
+        return Err(format!("Worker stopped. Retry the run: {}", error));
+    }
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { kill_pid(current.pid, true); return Err("Run cancelled.".into()); }
+    Ok(())
+}
 
-        let t_stdout = tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stdout);
-            let mut buf = [0u8; 1024];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = app_out.emit("execution-stdout", StreamPayload { text });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let t_stderr = tokio::spawn(async move {
-            let mut reader = tokio::io::BufReader::new(stderr);
-            let mut buf = [0u8; 1024];
-            loop {
-                match reader.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                        let _ = app_err.emit("execution-stderr", StreamPayload { text });
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let exit_code = match child.wait().await {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
-        };
-
-        // Drain remaining I/O
-        let _ = tokio::join!(t_stdout, t_stderr, t_stats);
-
-        // Clear PID
-        {
-            let mut lock = pid_arc.lock().unwrap();
-            *lock = None;
-        }
-
-        let _ = app_done.emit("execution-done", DonePayload { exit_code });
-    });
-
+#[tauri::command]
+async fn unload_model(handle: State<'_, ExecutionHandle>) -> Result<(), String> {
+    if handle.execution_pid.lock().unwrap().is_some() { return Err("Stop the active run before unloading.".into()); }
+    if let Some(worker) = handle.worker.lock().await.take() { kill_pid(worker.pid, true); }
     Ok(())
 }
 
@@ -1763,19 +1798,21 @@ fn cancel_execution(handle: State<'_, ExecutionHandle>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn is_model_downloaded(model_id: String, storage_path: String) -> Result<bool, String> {
-    let model_dir = model_dir_from_id(&storage_path, &model_id);
-    let marker = model_dir.join(".huggingbox_complete");
-    Ok(marker.exists())
+fn is_model_downloaded(model_id: String, storage_path: String, runtime: Option<String>, gguf_file: Option<String>) -> Result<bool, String> {
+    Ok(cache_ready(&model_cache_dir(&storage_path, &model_id)?, runtime.as_deref(), gguf_file.as_deref()))
 }
 
 #[tauri::command]
 async fn download_model(
     app: AppHandle,
+    env_storage_path: Option<String>,
     handle: State<'_, ExecutionHandle>,
     model_id: String,
     storage_path: String,
     hf_token: Option<String>,
+    venv_model_id: Option<String>,
+    runtime: String,
+    gguf_file: Option<String>,
 ) -> Result<(), String> {
     {
         let lock = handle.download_pid.lock().unwrap();
@@ -1784,105 +1821,20 @@ async fn download_model(
         }
     }
 
-    let python = resolve_python(&app, Some(&model_id)).await?;
-    let model_dir = model_dir_from_id(&storage_path, &model_id);
+    let env_model = venv_model_id.as_deref().unwrap_or(&model_id);
+    validate_model_id(env_model)?;
+    let python = resolve_python_in(&app, env_model, env_storage_path.as_deref()).await?;
+    let model_dir = model_cache_dir(&storage_path, &model_id)?;
     std::fs::create_dir_all(&model_dir).map_err(|e| format!("Failed to create model directory: {}", e))?;
 
-    let script = r#"
-import os
-import sys
-import time
-import json
-
-os.environ["HF_XET_HIGH_PERFORMANCE"] = "1"
-
-from huggingface_hub import HfApi, hf_hub_download
-
-model_id = sys.argv[1]
-target_dir = sys.argv[2]
-token = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] else None
-
-try:
-    import hf_xet  # noqa: F401
-    print("[HuggingBox] Xet high-performance downloads enabled.", flush=True)
-except Exception:
-    print("[HuggingBox] hf_xet not installed; using standard downloader.", flush=True)
-
-api = HfApi(token=token)
-info = api.model_info(model_id)
-files = []
-total = 0
-for s in info.siblings:
-    name = getattr(s, "rfilename", None)
-    if not name:
-        continue
-    size = getattr(s, "size", None) or 0
-    files.append((name, int(size)))
-    total += int(size)
-
-downloaded = 0
-files_done = 0
-files_total = len(files)
-start = time.time()
-
-def emit(phase, filename=None):
-    elapsed = max(0.001, time.time() - start)
-    speed = downloaded / elapsed
-    remaining = max(0, total - downloaded)
-    eta = (remaining / speed) if speed > 0 else None
-    if total > 0:
-        pct = (downloaded / total * 100.0)
-    elif files_total > 0:
-        pct = (files_done / files_total * 100.0)
-    else:
-        pct = 0.0
-    payload = {
-        "percent": pct,
-        "downloaded_bytes": downloaded,
-        "total_bytes": total,
-        "speed_bps": speed,
-        "eta_seconds": eta,
-        "phase": phase,
-        "files_done": files_done,
-        "files_total": files_total,
-        "filename": filename,
-    }
-    print("HB_DOWNLOAD_JSON:" + json.dumps(payload), flush=True)
-
-print(f"[HuggingBox] Downloading {model_id} into {target_dir}", flush=True)
-emit("starting")
-for (filename, size) in files:
-    hf_hub_download(
-        repo_id=model_id,
-        filename=filename,
-        token=token,
-        local_dir=target_dir,
-    )
-    files_done += 1
-    downloaded += max(0, size)
-    emit("downloading", filename)
-
-marker = os.path.join(target_dir, ".huggingbox_complete")
-with open(marker, "w", encoding="utf-8") as f:
-    f.write(str(time.time()))
-emit("complete")
-print("[HuggingBox] Download complete.", flush=True)
-"#;
-
-    let script_path = std::env::temp_dir().join("huggingbox_download.py");
-    std::fs::write(&script_path, script).map_err(|e| e.to_string())?;
-
-    let token = hf_token.unwrap_or_default();
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Download cancelled.".into()); }
     let mut dl_cmd = tokio::process::Command::new(&python);
     apply_no_window_tokio(&mut dl_cmd);
-    let mut child = dl_cmd
-        .arg(script_path.to_str().ok_or("invalid path")?)
-        .arg(model_id.clone())
-        .arg(model_dir.to_string_lossy().to_string())
-        .arg(token)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    if let Some(parent) = hf_auto_runner_parent_dir(&app) { dl_cmd.env("PYTHONPATH", parent); }
+    dl_cmd.env("HF_TOKEN", hf_token.unwrap_or_default());
+    dl_cmd.args(["-m", "hf_auto_runner.artifacts", &model_id, &model_dir.to_string_lossy(), &runtime]);
+    if let Some(file) = gguf_file { dl_cmd.args(["--gguf", &file]); }
+    let mut child = dl_cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("Failed to start model download: {}", e))?;
 
     let pid_arc = handle.download_pid.clone();
@@ -1891,6 +1843,7 @@ print("[HuggingBox] Download complete.", flush=True)
         *lock = child.id();
     }
 
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { let _ = child.kill().await; }
     let stdout = child.stdout.take().ok_or("no stdout")?;
     let stderr = child.stderr.take().ok_or("no stderr")?;
     let app2 = app.clone();
@@ -2030,16 +1983,18 @@ fn list_downloaded_models(storage_path: String) -> Result<Vec<DownloadedModelPay
     Ok(models)
 }
 
-#[tauri::command]
-fn delete_downloaded_model(model_id: String, storage_path: String) -> Result<(), String> {
-    validate_model_id(&model_id)?;
-    let model_dir = model_dir_from_id(&storage_path, &model_id);
-    if !model_dir.exists() {
-        return Ok(());
-    }
-    std::fs::remove_dir_all(&model_dir)
-        .map_err(|e| format!("Failed to remove downloaded model: {}", e))?;
+fn remove_model_cache(storage: &str, model: &str) -> Result<(), String> {
+    let cache = model_cache_dir(storage, model)?;
+    if cache.exists() { std::fs::remove_dir_all(cache).map_err(|e| e.to_string())?; }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_downloaded_model(model_id: String, storage_path: String, handle: State<'_, ExecutionHandle>) -> Result<(), String> {
+    if handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() {
+        return Err("Stop the active job before removing model files.".into());
+    }
+    remove_model_cache(&storage_path, &model_id)
 }
 
 #[tauri::command]
@@ -2063,6 +2018,7 @@ fn list_model_workspace_entries(
     let entries = std::fs::read_dir(&dir_path)
         .map_err(|e| format!("Failed to read workspace directory: {}", e))?;
     for entry in entries.flatten() {
+        if entry.file_name() == ".weights" { continue; }
         let path = entry.path();
         let Ok(meta) = std::fs::metadata(&path) else {
             continue;
@@ -2205,9 +2161,11 @@ async fn get_model_environment_size(
 #[tauri::command]
 fn delete_model_environment(
     app: AppHandle,
+    handle: State<'_, ExecutionHandle>,
     model_id: String,
     env_storage_path: Option<String>,
 ) -> Result<(), String> {
+    if handle.execution_pid.lock().unwrap().is_some() || handle.download_pid.lock().unwrap().is_some() || handle.preparation_pid.lock().unwrap().is_some() || handle.worker.try_lock().map(|w| w.is_some()).unwrap_or(true) { return Err("Stop and unload the model before deleting an environment.".into()); }
     let root = effective_venv_root(&app, env_storage_path.as_deref())?;
     let dir = model_venv_dir_from_root(&root, &model_id)?;
     if !dir.exists() {
@@ -2221,6 +2179,7 @@ fn delete_model_environment(
 #[tauri::command]
 async fn check_packages(
     app: AppHandle,
+    env_storage_path: Option<String>,
     packages: Vec<String>,
     model_id: Option<String>,
     venv_model_id: Option<String>,
@@ -2233,7 +2192,7 @@ async fn check_packages(
     if let Some(ref env_model) = resolved_env {
         validate_model_id(env_model)?;
     }
-    let python = resolve_python(&app, resolved_env.as_deref()).await?;
+    let python = resolve_python_in(&app, resolved_env.as_deref().unwrap_or("default"), env_storage_path.as_deref()).await?;
     let mut missing = Vec::new();
 
     for pkg in &packages {
@@ -2257,6 +2216,9 @@ async fn check_packages(
 #[tauri::command]
 async fn probe_model_dependencies(
     app: AppHandle,
+    env_storage_path: Option<String>,
+    handle: State<'_, ExecutionHandle>,
+    storage_path: Option<String>,
     model_id: String,
     hf_token: Option<String>,
     venv_model_id: Option<String>,
@@ -2267,12 +2229,13 @@ async fn probe_model_dependencies(
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| model_id.clone());
     validate_model_id(&resolved_env)?;
-    let python = resolve_python(&app, Some(&resolved_env)).await?;
+    let python = resolve_python_in(&app, &resolved_env, env_storage_path.as_deref()).await?;
     let script = r##"
 import json
 import re
 import sys
 import shlex
+from pathlib import Path
 from huggingface_hub import HfApi, hf_hub_download
 
 model_id = sys.argv[1]
@@ -2431,8 +2394,8 @@ def extract_repo_requirements(model_id: str, token: str | None):
             add_req(token)
 
     try:
-        api = HfApi(token=token or None)
-        files = api.list_repo_files(repo_id=model_id, repo_type="model")
+        local = Path(model_id)
+        files = [str(p.relative_to(local)).replace("\\", "/") for p in local.rglob("*") if p.is_file()] if local.is_dir() else HfApi(token=token or None).list_repo_files(repo_id=model_id, repo_type="model")
         lower_to_real = {f.lower(): f for f in files}
         candidates = []
         for key in [
@@ -2453,7 +2416,7 @@ def extract_repo_requirements(model_id: str, token: str | None):
 
         for filename in candidates:
             try:
-                path = hf_hub_download(repo_id=model_id, filename=filename, token=token or None)
+                path = str(Path(model_id) / filename) if Path(model_id).is_dir() else hf_hub_download(repo_id=model_id, filename=filename, token=token or None)
                 with open(path, "r", encoding="utf-8") as fh:
                     for line in fh:
                         add_req(line)
@@ -2464,7 +2427,7 @@ def extract_repo_requirements(model_id: str, token: str | None):
         readme_name = lower_to_real.get("readme.md")
         if readme_name:
             try:
-                readme_path = hf_hub_download(repo_id=model_id, filename=readme_name, token=token or None)
+                readme_path = str(Path(model_id) / readme_name) if Path(model_id).is_dir() else hf_hub_download(repo_id=model_id, filename=readme_name, token=token or None)
                 with open(readme_path, "r", encoding="utf-8") as rh:
                     parse_requirements_from_text(rh.read())
             except Exception:
@@ -2475,9 +2438,14 @@ def extract_repo_requirements(model_id: str, token: str | None):
     return found
 
 compatibility_error = None
+manifest_path = Path(model_id) / ".huggingbox_complete"
+manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+if manifest.get("runtime") in {"llama_cpp", "diffusers"}:
+    print("HB_PROBE_JSON:" + json.dumps({"missingPackages": [], "requiredPackages": extract_repo_requirements(model_id, token), "compatibilityError": None}), flush=True)
+    sys.exit(0)
 required = extract_repo_requirements(model_id, token)
 try:
-    from transformers import AutoConfig, AutoModel
+    from transformers import AutoConfig
 except Exception as import_err:
     err_text = str(import_err)
     missing = extract_missing_packages(err_text)
@@ -2492,7 +2460,6 @@ except Exception as import_err:
 
 try:
     cfg = call_with_token(AutoConfig.from_pretrained, model_id, trust_remote_code=True)
-    call_with_token(AutoModel.from_config, cfg, trust_remote_code=True)
     missing = []
 except Exception as err:
     err_text = str(err)
@@ -2512,6 +2479,8 @@ except Exception as err:
         compatibility_error = (
             "Windows trust_remote_code prompt failed. Regenerate code and ensure trust_remote_code=True is used."
         )
+    elif not missing:
+        compatibility_error = err_text
 
 print("HB_PROBE_JSON:" + json.dumps({
     "missingPackages": missing,
@@ -2523,18 +2492,24 @@ print("HB_PROBE_JSON:" + json.dumps({
     let script_path = std::env::temp_dir().join("huggingbox_probe_deps.py");
     std::fs::write(&script_path, script).map_err(|e| e.to_string())?;
 
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Preparation cancelled.".into()); }
+    let source = if let Some(storage) = storage_path { model_cache_dir(&storage, &model_id)?.to_string_lossy().to_string() } else { model_id };
     let token = hf_token.unwrap_or_default();
     let mut probe_cmd = tokio::process::Command::new(&python);
     apply_no_window_tokio(&mut probe_cmd);
-    let output = probe_cmd
+    let mut child = probe_cmd
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .arg(script_path.to_string_lossy().to_string())
-        .arg(model_id)
+        .arg(source)
         .arg(token)
-        .output()
-        .await
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
         .map_err(|e| format!("Failed to run dependency probe: {}", e))?;
+    *handle.preparation_pid.lock().unwrap() = child.id();
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { let _ = child.kill().await; }
+    let output = child.wait_with_output().await.map_err(|e| e.to_string())?;
+    *handle.preparation_pid.lock().unwrap() = None;
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Preparation cancelled.".into()); }
 
     let _ = std::fs::remove_file(&script_path);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2602,9 +2577,6 @@ fn extract_shell_marker(output: &str, marker_prefix: &str) -> (String, Option<St
 }
 
 fn normalize_requirement_for_install(requirement: &str) -> String {
-    if requirement_name(requirement) == "transformers" {
-        return HF_TRANSFORMERS_GIT_URL.to_string();
-    }
     requirement.to_string()
 }
 
@@ -2612,7 +2584,9 @@ async fn run_pip_install_with_progress(
     app: &AppHandle,
     python: &str,
     args: Vec<String>,
+    handle: &ExecutionHandle,
 ) -> Result<(), String> {
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Preparation cancelled.".into()); }
     let mut pip_install_cmd = tokio::process::Command::new(python);
     apply_no_window_tokio(&mut pip_install_cmd);
     let mut child = pip_install_cmd
@@ -2622,6 +2596,8 @@ async fn run_pip_install_with_progress(
         .spawn()
         .map_err(|e| e.to_string())?;
 
+    *handle.preparation_pid.lock().unwrap() = child.id();
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { let _ = child.kill().await; }
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let app2 = app.clone();
@@ -2643,6 +2619,8 @@ async fn run_pip_install_with_progress(
 
     let status = child.wait().await.map_err(|e| e.to_string())?;
     let _ = tokio::join!(t1, t2);
+    *handle.preparation_pid.lock().unwrap() = None;
+    if handle.preparation_cancelled.load(Ordering::SeqCst) { return Err("Preparation cancelled.".into()); }
     if status.success() {
         Ok(())
     } else {
@@ -2653,6 +2631,8 @@ async fn run_pip_install_with_progress(
 #[tauri::command]
 async fn install_packages(
     app: AppHandle,
+    env_storage_path: Option<String>,
+    handle: State<'_, ExecutionHandle>,
     packages: Vec<String>,
     model_id: Option<String>,
     venv_model_id: Option<String>,
@@ -2666,20 +2646,16 @@ async fn install_packages(
         validate_model_id(env_model)?;
     }
 
-    let python = resolve_python(&app, execution_env_model.as_deref()).await?;
+    let python = resolve_python_in(&app, execution_env_model.as_deref().unwrap_or("default"), env_storage_path.as_deref()).await?;
     let mut torch_family = Vec::new();
     let mut other_packages = Vec::new();
     let mut flash_attn_packages = Vec::new();
     let mut requested_torch_name = false;
     let mut requested_torchvision_or_audio = false;
     let mut requested_flash_attn = false;
-    let mut requested_transformers = false;
     for pkg in packages {
         let name = requirement_name(&pkg);
         let normalized_pkg = normalize_requirement_for_install(&pkg);
-        if name == "transformers" {
-            requested_transformers = true;
-        }
         if name == "flash-attn" || name == "flash_attn" {
             requested_flash_attn = true;
             flash_attn_packages.push(normalized_pkg);
@@ -2698,27 +2674,6 @@ async fn install_packages(
         }
     }
 
-    if requested_transformers {
-        let mut dropped_conflicts: Vec<String> = Vec::new();
-        other_packages.retain(|pkg| {
-            let name = requirement_name(pkg);
-            let is_conflict = name == "tokenizers" || name == "huggingface-hub";
-            if is_conflict {
-                dropped_conflicts.push(pkg.clone());
-            }
-            !is_conflict
-        });
-
-        if !dropped_conflicts.is_empty() {
-            let _ = app.emit("install-progress", StreamPayload {
-                text: format!(
-                    "[HuggingBox] Dropping conflicting pins with HF transformers source: {}\n",
-                    dropped_conflicts.join(", ")
-                ),
-            });
-        }
-    }
-
     // torchvision/torchaudio wheels must match the torch build.
     // If callers request torchvision/torchaudio alone, include torch to keep versions aligned.
     if requested_torchvision_or_audio && !requested_torch_name {
@@ -2728,15 +2683,6 @@ async fn install_packages(
     // in the same transaction so torch/torchvision versions stay aligned.
     if requested_torch_name && !requested_torchvision_or_audio && requested_flash_attn {
         torch_family.push("torchvision".to_string());
-    }
-
-    if requested_transformers {
-        let _ = app.emit("install-progress", StreamPayload {
-            text: format!(
-                "[HuggingBox] Preferring Hugging Face transformers source: {}\n",
-                HF_TRANSFORMERS_GIT_URL
-            ),
-        });
     }
 
     let has_cuda_gpu = !detect_cuda_gpus().is_empty();
@@ -2753,24 +2699,24 @@ async fn install_packages(
         ];
         cuda_args.extend(torch_family.clone());
 
-        if run_pip_install_with_progress(&app, &python, cuda_args).await.is_err() {
+        if run_pip_install_with_progress(&app, &python, cuda_args, &handle).await.is_err() {
             let _ = app.emit("install-progress", StreamPayload {
                 text: "[HuggingBox] CUDA wheel install failed. Falling back to default PyPI packages.\n".to_string(),
             });
             let mut fallback_args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
             fallback_args.extend(torch_family);
-            run_pip_install_with_progress(&app, &python, fallback_args).await?;
+            run_pip_install_with_progress(&app, &python, fallback_args, &handle).await?;
         }
     } else if !torch_family.is_empty() {
         let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
         args.extend(torch_family);
-        run_pip_install_with_progress(&app, &python, args).await?;
+        run_pip_install_with_progress(&app, &python, args, &handle).await?;
     }
 
     if !other_packages.is_empty() {
         let mut args = vec!["-m".to_string(), "pip".to_string(), "install".to_string()];
         args.extend(other_packages);
-        run_pip_install_with_progress(&app, &python, args).await?;
+        run_pip_install_with_progress(&app, &python, args, &handle).await?;
     }
 
     if !flash_attn_packages.is_empty() {
@@ -2788,7 +2734,7 @@ async fn install_packages(
                 "wheel".to_string(),
                 "setuptools".to_string(),
             ];
-            let _ = run_pip_install_with_progress(&app, &python, bootstrap_args).await;
+            let _ = run_pip_install_with_progress(&app, &python, bootstrap_args, &handle).await;
 
             let _ = app.emit("install-progress", StreamPayload {
                 text: "[HuggingBox] Installing flash-attn with --no-build-isolation.\n".to_string(),
@@ -2800,7 +2746,7 @@ async fn install_packages(
                 "--no-build-isolation".to_string(),
             ];
             args.extend(flash_attn_packages);
-            if let Err(e) = run_pip_install_with_progress(&app, &python, args).await {
+            if let Err(e) = run_pip_install_with_progress(&app, &python, args, &handle).await {
                 let _ = app.emit("install-progress", StreamPayload {
                     text: format!(
                         "[HuggingBox] Optional dependency flash-attn failed to install: {}. Continuing without it.\n",
@@ -3009,11 +2955,17 @@ pub fn run() {
             bootstrap_python_environment,
             detect_python,
             generate_python_code_local,
+            assistant_cli::generate_code_with_cli,
             generate_code_with_claude,
             run_python_code,
+            unload_model,
             run_model_shell_command,
             cancel_execution,
             is_model_downloaded,
+            read_model_metadata,
+            begin_preparation,
+            environment_fingerprint,
+            cancel_preparation,
             download_model,
             cancel_download,
             list_downloaded_models,
@@ -3035,4 +2987,46 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod workflow_tests {
+    use super::*;
+    fn root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!("huggingbox-test-{}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir(&path).unwrap(); path
+    }
+    #[test]
+    fn removing_cache_preserves_scripts_results_and_legacy_files() {
+        let root = root(); let model = root.join("org/model");
+        std::fs::create_dir_all(model.join(".weights")).unwrap();
+        std::fs::create_dir_all(model.join("outputs")).unwrap();
+        for name in ["huggingbox_main.py", "outputs/result.png", "legacy.safetensors", ".weights/model.safetensors"] { std::fs::write(model.join(name), b"keep").unwrap(); }
+        remove_model_cache(root.to_str().unwrap(), "org/model").unwrap();
+        assert!(!model.join(".weights").exists());
+        for name in ["huggingbox_main.py", "outputs/result.png", "legacy.safetensors"] { assert!(model.join(name).exists()); }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn readiness_requires_all_declared_files_and_variant() {
+        let root = root();std::fs::write(root.join("m.gguf"), b"ok").unwrap();
+        std::fs::write(root.join(".huggingbox_complete"), r#"{"schema":1,"runtime":"llama_cpp","gguf":"m.gguf","files":[{"path":"m.gguf","size":2}]}"#).unwrap();
+        assert!(cache_ready(&root, Some("llama_cpp"), Some("m.gguf")));
+        assert!(!cache_ready(&root, Some("llama_cpp"), Some("other.gguf")));
+        std::fs::remove_file(root.join("m.gguf")).unwrap();assert!(!cache_ready(&root, None, None));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unsafe_model_ids_are_rejected() {
+        for name in ["../model", "/model", "C:/model", "org//model", "org\\model"] { assert!(validate_model_id(name).is_err()); }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_cache_parent_cannot_delete_outside_storage() {
+        let outside = root(); let root = root();
+        std::os::unix::fs::symlink(&outside, root.join("org")).unwrap();
+        assert!(remove_model_cache(root.to_str().unwrap(), "org/model").is_err());
+        assert!(outside.exists()); std::fs::remove_dir_all(root).unwrap(); std::fs::remove_dir_all(outside).unwrap();
+    }
 }

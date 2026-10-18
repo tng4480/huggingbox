@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { persist } from 'zustand/middleware';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -50,7 +51,8 @@ export type ExecutionState =
   | 'running'
   | 'completed'
   | 'error'
-  | 'cancelled';
+  | 'cancelled'
+  | 'stopping';
 
 export interface SystemInfo {
   totalRam: number;
@@ -68,7 +70,9 @@ export interface AppSettings {
   envStoragePath: string;
   preferredDevice: 'auto' | 'cpu' | 'cuda';
   selectedGpuId: string | null;
-  codeGenerationProvider: 'autorunner' | 'claude-sonnet';
+  codeGenerationProvider: 'autorunner' | 'claude-sonnet' | 'codex-cli' | 'claude-code';
+  codexCliPath?: string;
+  claudeCodePath?: string;
   claudeAutoInstallDependencies: boolean;
   theme: 'dark' | 'light';
 }
@@ -106,7 +110,20 @@ function trimOutputBuffer(current: string, incoming: string): string {
 
 // ─── Store Interface ─────────────────────────────────────────────────────────
 
+export interface RunRecord {
+  id: string; modelId: string; input: string; output: string; state: ExecutionState;
+  elapsed: number; created: string; runtime: string | null; tokensPerSecond: number | null;
+}
+
 interface AppStore {
+  activeJobId: string | null;
+  activeRunInput: string;
+  workspaceDrafts: Record<string, Record<string, unknown>>;
+  modelCache: Record<string, HFModelDetail>;
+  codeByModel: Record<string, string>;
+  runHistory: RunRecord[];
+  setWorkspaceDraft: (modelId: string, patch: Record<string, unknown>) => void;
+  finishRun: (state: ExecutionState) => void;
   // Navigation
   currentView: 'browse' | 'model-detail' | 'my-models' | 'settings';
   selectedModelId: string | null;
@@ -208,7 +225,21 @@ interface AppStore {
 
 // ─── Store Implementation ────────────────────────────────────────────────────
 
-export const useAppStore = create<AppStore>((set) => ({
+export const useAppStore = create<AppStore>()(persist((set) => ({
+  activeJobId: null,
+  activeRunInput: '',
+  workspaceDrafts: {}, modelCache: {}, codeByModel: {}, runHistory: [],
+  setWorkspaceDraft: (id, patch) => set(s => ({workspaceDrafts: {...s.workspaceDrafts, [id]: {...s.workspaceDrafts[id], ...patch}}})),
+  finishRun: (state) => set(s => ({
+    executionState: state,
+    activeJobId: null,
+    runHistory: s.activeJobId && s.activeExecutionModelId ? [{
+      id: s.activeJobId, modelId: s.activeExecutionModelId, input: s.activeRunInput,
+      output: (s.executionError ? s.executionError + '\n' : '') + s.executionOutput.slice(-16000),
+      state, elapsed: s.executionElapsed, created: new Date().toISOString(),
+      runtime: s.executionStats.executionRuntime, tokensPerSecond: s.executionStats.tokensPerSecond,
+    }, ...s.runHistory].slice(0, 20) : s.runHistory,
+  })),
   // Navigation
   currentView: 'browse',
   selectedModelId: null,
@@ -287,49 +318,13 @@ export const useAppStore = create<AppStore>((set) => ({
 
   setCurrentView: (view) => set({ currentView: view }),
   setSelectedModelId: (id) => set({ selectedModelId: id }),
-  navigateToModel: (id, options) =>
-    set((s) => {
-      if (options?.preserveWorkspace) {
-        return {
-          selectedModelId: id,
-          currentView: 'model-detail',
-        };
-      }
-
-      return {
-        selectedModelId: id,
-        currentView: 'model-detail',
-        modelDetail: null,
-        modelDetailError: null,
-        selectedGguf: null,
-        generatedCode: null,
-        codeSource: null,
-        executionState: 'idle',
-        executionOutput: '',
-        stderrOutput: '',
-        executionError: null,
-        executionStartTime: null,
-        executionElapsed: 0,
-        downloadStats: null,
-        executionStats: {
-          executionRuntime: null,
-          executionProvider: null,
-          processRssBytes: null,
-          processVirtualMemoryBytes: null,
-          processGpuBytes: null,
-          tokensPerSecond: null,
-          inferenceSeconds: null,
-        },
-        activeExecutionModelId:
-          s.activeExecutionModelId && s.activeExecutionModelId === id
-            ? s.activeExecutionModelId
-            : null,
-        activeExecutionEnvModelId:
-          s.activeExecutionModelId && s.activeExecutionModelId === id
-            ? s.activeExecutionEnvModelId
-            : null,
-      };
-    }),
+  navigateToModel: (id, _options) => set(s => ({
+    selectedModelId: id, currentView: 'model-detail', codeGenerating: false,
+    modelDetail: s.modelCache[id] ?? null, modelDetailError: null,
+    selectedGguf: (s.workspaceDrafts[id]?.selectedGguf as string | null) ?? null,
+    generatedCode: s.codeByModel[id] ?? null,
+    codeSource: s.codeByModel[id] ? 'edited' : null,
+  })),
   navigateToBrowse: () =>
     set({ currentView: 'browse', selectedModelId: null }),
   setActiveExecutionModelId: (id) => set({ activeExecutionModelId: id }),
@@ -348,11 +343,11 @@ export const useAppStore = create<AppStore>((set) => ({
   setModelsError: (err) => set({ modelsError: err }),
   setBrowseScrollPosition: (pos) => set({ browseScrollPosition: pos }),
 
-  setModelDetail: (detail) => set({ modelDetail: detail }),
+  setModelDetail: (detail) => set(s => ({modelDetail: detail && (detail.modelId ?? detail.id) !== s.selectedModelId ? s.modelDetail : detail, modelCache: detail ? {...s.modelCache, [detail.modelId ?? detail.id]: detail} : s.modelCache})),
   setModelDetailLoading: (loading) => set({ modelDetailLoading: loading }),
   setModelDetailError: (err) => set({ modelDetailError: err }),
-  setSelectedGguf: (file) => set({ selectedGguf: file }),
-  setGeneratedCode: (code) => set({ generatedCode: code }),
+  setSelectedGguf: (file) => set(s => ({selectedGguf: file, workspaceDrafts: s.selectedModelId ? {...s.workspaceDrafts, [s.selectedModelId]: {...s.workspaceDrafts[s.selectedModelId], selectedGguf: file}} : s.workspaceDrafts})),
+  setGeneratedCode: (code) => set(s => ({generatedCode: code, codeByModel: s.selectedModelId && code !== null ? {...s.codeByModel, [s.selectedModelId]: code} : s.codeByModel})),
   setCodeGenerating: (gen) => set({ codeGenerating: gen }),
   setCodeSource: (src) => set({ codeSource: src }),
 
@@ -387,17 +382,13 @@ export const useAppStore = create<AppStore>((set) => ({
   updateSettings: (patch) =>
     set((s) => {
       const newSettings = { ...s.settings, ...patch };
-      if (
-        patch.claudeApiKey !== undefined &&
-        patch.claudeApiKey.trim() !== '' &&
-        s.settings.codeGenerationProvider === 'autorunner'
-      ) {
-        newSettings.codeGenerationProvider = 'claude-sonnet';
-      }
       return { settings: newSettings };
     }),
   setTheme: (theme) =>
     set((s) => ({ settings: { ...s.settings, theme } })),
 
   setDownloadedModels: (models) => set({ downloadedModels: models }),
+}), {
+  name: 'huggingbox-workspaces-v1',
+  partialize: s => ({workspaceDrafts: s.workspaceDrafts, modelCache: s.modelCache, codeByModel: s.codeByModel, runHistory: s.runHistory}),
 }));

@@ -179,7 +179,7 @@ pub async fn lab_start(
     *active.lock().unwrap() = Some((id.clone(), 0));
     let started=async{
         let p=run_path(&app,&id)?;std::fs::create_dir(&p).map_err(|e|e.to_string())?;
-        std::fs::write(p.join("status.json"),json!({"id":id,"action":action,"backend":backend,"status":"running","path":p}).to_string()).map_err(|e|e.to_string())?;
+        std::fs::write(p.join("status.json"),json!({"id":id,"action":action,"backend":backend,"task":config["task"].as_str().unwrap_or("text-generation"),"status":"running","path":p}).to_string()).map_err(|e|e.to_string())?;
         if let Some(source)=config["run_id"].as_str(){config["run_path"]=json!(run_path(&app,source)?);}
         if let Some(source)=config["resume_id"].as_str().filter(|s|!s.is_empty()){config["resume_path"]=json!(run_path(&app,source)?);}
         if let Some(source)=config["inspection_run_id"].as_str().filter(|s|!s.is_empty()){config["inspection_run_path"]=json!(run_path(&app,source)?);}
@@ -194,7 +194,7 @@ pub async fn lab_start(
         for key in ["HF_TOKEN","ANTHROPIC_API_KEY","OPENAI_API_KEY"]{command.env_remove(key);}
         if action=="setup"{
             command.args(["-m","pip","install"]);
-            if backend=="mlx"{command.args(["mlx-lm[train]>=0.32,<0.33"]);}else{command.args(["torch>=2.6,<3","transformers>=5.5,<6","peft>=0.17,<1","jlens @ git+https://github.com/anthropics/jacobian-lens.git@581d398613e5602a5af361e1c34d3a92ea82ba8e"]);}
+            if backend=="mlx"{command.args(["mlx-lm[train]>=0.32,<0.33"]);}else{command.args(["torch>=2.6,<3","transformers>=5.5,<6","peft>=0.17,<1","pillow>=10,<13","jlens @ git+https://github.com/anthropics/jacobian-lens.git@581d398613e5602a5af361e1c34d3a92ea82ba8e"]);}
         }else{
             command.env("HF_HUB_OFFLINE","1").env("TRANSFORMERS_OFFLINE","1");
             std::fs::write(p.join("config.json"),config.to_string()).map_err(|e|e.to_string())?;
@@ -205,7 +205,7 @@ pub async fn lab_start(
         let pid=child.id().ok_or("No process ID")?;*active.lock().unwrap()=Some((id.clone(),pid));
         if cancelled.load(Ordering::SeqCst){super::kill_pid(pid,true);}
         let stdout=child.stdout.take().unwrap();let stderr=child.stderr.take().unwrap();
-        let status=json!({"id":id,"action":action,"backend":backend,"status":"running","path":p});
+        let status=json!({"id":id,"action":action,"backend":backend,"task":config["task"].as_str().unwrap_or("text-generation"),"status":"running","path":p});
         std::fs::write(p.join("status.json"),status.to_string()).map_err(|e|e.to_string())?;
         let log=Arc::new(tokio::sync::Mutex::new(tokio::fs::File::create(p.join("log.txt")).await.map_err(|e|e.to_string())?));
         let read_log=log.clone();let read_err=log;
@@ -221,7 +221,7 @@ pub async fn lab_start(
     }.await;
     if let Err(ref error) = started {
         if let Ok(p) = run_path(&app, &id) {
-            let _=std::fs::write(p.join("status.json"),json!({"id":id,"action":action,"backend":backend,"status":if state.cancelled.load(Ordering::SeqCst){"cancelled"}else{"failed"},"path":p}).to_string());
+            let _=std::fs::write(p.join("status.json"),json!({"id":id,"action":action,"backend":backend,"task":config["task"].as_str().unwrap_or("text-generation"),"status":if state.cancelled.load(Ordering::SeqCst){"cancelled"}else{"failed"},"path":p}).to_string());
             let _ = std::fs::write(p.join("error.json"), json!({"message":error}).to_string());
         }
         *state.active.lock().unwrap() = None;
@@ -235,12 +235,28 @@ pub fn lab_dataset_draft(
     app: AppHandle,
     state: State<'_, LabState>,
     text: Option<String>,
+    task: Option<String>,
 ) -> Result<String, String> {
     let _guard = state.draft.lock().unwrap();
-    let path = root(&app)?
-        .parent()
-        .ok_or("Lab directory missing")?
-        .join("dataset-draft.jsonl");
+    let task = task.unwrap_or_else(|| "text-generation".into());
+    if ![
+        "text-generation",
+        "text-classification",
+        "image-classification",
+    ]
+    .contains(&task.as_str())
+    {
+        return Err("Unsupported task".into());
+    }
+    let path =
+        root(&app)?
+            .parent()
+            .ok_or("Lab directory missing")?
+            .join(if task == "text-generation" {
+                "dataset-draft.jsonl".to_string()
+            } else {
+                format!("dataset-{task}.jsonl")
+            });
     if let Some(text) = text {
         if text.len() > 8_000_000 {
             return Err("Dataset must be at most 8 MB".into());
@@ -282,4 +298,49 @@ mod tests {
         assert!(state.cancelled.load(Ordering::SeqCst));
         assert!(state.active.lock().unwrap().is_none());
     }
+}
+
+#[tauri::command]
+pub fn lab_import_image_folder(path: String) -> Result<String, String> {
+    let root = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let mut classes = std::fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect::<Vec<_>>();
+    classes.sort_by_key(|e| e.file_name());
+    for class in classes {
+        if !class.file_type().map_err(|e| e.to_string())?.is_dir() {
+            continue;
+        }
+        let label = class.file_name().to_string_lossy().to_string();
+        if label.starts_with('.') {
+            continue;
+        }
+        let mut files = std::fs::read_dir(class.path())
+            .map_err(|e| e.to_string())?
+            .flatten()
+            .collect::<Vec<_>>();
+        files.sort_by_key(|e| e.file_name());
+        for file in files {
+            let p = file.path();
+            let ext = p
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            if p.is_file() && ["jpg", "jpeg", "png", "webp", "bmp"].contains(&ext.as_str()) {
+                rows.push(json!({"image":p,"label":label}).to_string());
+                if rows.len() > 10000 {
+                    return Err("Maximum 10,000 images".into());
+                }
+            }
+        }
+    }
+    if rows.is_empty() {
+        return Err("Choose a folder containing one subfolder per class, with images directly inside each class folder.".into());
+    }
+    Ok(rows.join("\n"))
 }

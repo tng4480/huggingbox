@@ -2963,7 +2963,7 @@ pub fn run() {
             detect_python,
             generate_python_code_local,
             assistant_cli::generate_code_with_cli,
-            lab::lab_start, lab::lab_cancel, lab::lab_runs, lab::lab_run_detail, lab::lab_read_dataset, lab::lab_dataset_draft,
+            lab::lab_start, lab::lab_cancel, lab::lab_runs, lab::lab_run_detail, lab::lab_read_dataset, lab::lab_dataset_draft, lab::lab_import_image_folder,
             generate_code_with_claude,
             run_python_code,
             unload_model,

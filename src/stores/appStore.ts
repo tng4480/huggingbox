@@ -392,5 +392,5 @@ export const useAppStore = create<AppStore>()(persist((set) => ({
   setDownloadedModels: (models) => set({ downloadedModels: models }),
 }), {
   name: 'huggingbox-workspaces-v1',
-  partialize: s => ({workspaceDrafts: {...s.workspaceDrafts, lab: {...s.workspaceDrafts.lab, dataset: undefined}}, modelCache: s.modelCache, codeByModel: s.codeByModel, runHistory: s.runHistory}),
+  partialize: s => ({workspaceDrafts: {...s.workspaceDrafts, lab: Object.fromEntries(Object.entries(s.workspaceDrafts.lab || {}).filter(([key]) => !key.startsWith('dataset')))}, modelCache: s.modelCache, codeByModel: s.codeByModel, runHistory: s.runHistory}),
 }));

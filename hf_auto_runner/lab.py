@@ -297,7 +297,21 @@ def main():
     path=Path(args.config).resolve();config=json.loads(path.read_text());root=path.parent
     try:
         action=config['action']
-        if action=='validate':
+        task=config.get('task','text-generation')
+        if task not in ('text-generation','text-classification','image-classification'):raise ValueError('Training is not implemented for this task.')
+        if action=='evaluate':
+            manifest=json.loads((Path(config['run_path'])/'manifest.json').read_text())
+            task=manifest.get('task','text-generation')
+        if task!='text-generation' and action in ('inspect','fit_lens'):raise ValueError('J-lens inspection currently supports language decoders only.')
+        if task!='text-generation':
+            from . import classification
+            if action=='validate':
+                splits,labels=classification.split_dataset(config['dataset'],task,int(config.get('seed',42)))
+                result={'counts':{k:len(v) for k,v in splits.items()},'preview':splits['train'][:3],'message':'Stratified split with every class represented. Labels: '+', '.join(labels)}
+            elif action=='train':result=classification.train(config,root)
+            elif action=='evaluate':result=classification.evaluate(config,root)
+            else:raise ValueError('Unsupported classification action')
+        elif action=='validate':
             splits=dataset(config['dataset'],int(config.get('seed',42)))
             result={'counts':{k:len(v) for k,v in splits.items()},'preview':splits['train'][:3],'message':'Response-only training; test examples remain excluded from training and validation.'}
         elif action=='train':result=train(config,root)

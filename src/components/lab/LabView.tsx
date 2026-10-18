@@ -12,6 +12,7 @@ type Run = {
   id: string;
   action: string;
   backend: string;
+  task?: string;
   status: string;
   checkpointAvailable?: boolean;
   path: string;
@@ -28,6 +29,16 @@ type Result = {
   adapter_path?: string;
   scores?: Record<string, number>;
   metric?: string;
+  task?: string;
+  classification_metrics?: Record<
+    string,
+    {
+      accuracy: number;
+      macro_f1: number;
+      labels: string[];
+      confusion_matrix: number[][];
+    }
+  >;
   rows?: {
     prompt: { role: string; content: string }[];
     expected: string;
@@ -57,6 +68,13 @@ const sample = Array.from({ length: 12 }, (_, i) =>
 ).join("\n");
 
 export default function LabView() {
+  const [task, setTask] = useWorkspaceDraft("lab", "task", "text-generation");
+  const [trainingMethod, setTrainingMethod] = useWorkspaceDraft(
+    "lab",
+    "trainingMethod",
+    "head",
+  );
+  const classification = task !== "text-generation";
   const [tab, setTab] = useWorkspaceDraft("lab", "tab", "train");
   const [model, setModel] = useWorkspaceDraft("lab", "model", "");
   const [backend, setBackend] = useWorkspaceDraft(
@@ -64,7 +82,7 @@ export default function LabView() {
     "backend",
     navigator.platform.toLowerCase().includes("mac") ? "mlx" : "torch",
   );
-  const [data, setData] = useWorkspaceDraft("lab", "dataset", "");
+  const [data, setData] = useWorkspaceDraft("lab", `dataset-${task}`, "");
   const [steps, setSteps] = useWorkspaceDraft("lab", "steps", 100);
   const [length, setLength] = useWorkspaceDraft("lab", "length", 256);
   const [rank, setRank] = useWorkspaceDraft("lab", "rank", 8);
@@ -113,10 +131,10 @@ export default function LabView() {
   }, [storagePath]);
   useEffect(() => {
     let live = true;
-    void invoke<string>("lab_dataset_draft", { text: null })
+    void invoke<string>("lab_dataset_draft", { text: null, task })
       .then((value) => {
         if (live) {
-          if (!useAppStore.getState().workspaceDrafts.lab?.dataset)
+          if (!useAppStore.getState().workspaceDrafts.lab?.[`dataset-${task}`])
             setData(value);
           setDraftReady(true);
         }
@@ -130,12 +148,12 @@ export default function LabView() {
     return () => {
       live = false;
     };
-  }, []);
+  }, [task]);
   useEffect(() => {
     if (!draftReady) return;
     let cancelled = false;
     const timer = setTimeout(() => {
-      void invoke("lab_dataset_draft", { text: data }).catch((e) => {
+      void invoke("lab_dataset_draft", { text: data, task }).catch((e) => {
         if (!cancelled) setError(String(e));
       });
     }, 350);
@@ -143,15 +161,21 @@ export default function LabView() {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [data, draftReady]);
+  }, [data, draftReady, task]);
   const active = runs.find((r) => r.status === "running");
   const busy = starting || Boolean(active) || Boolean(inferenceJob);
   const resumable = runs.filter(
     (r) =>
-      r.action === "train" && r.status !== "running" && r.checkpointAvailable,
+      r.action === "train" &&
+      r.status !== "running" &&
+      r.checkpointAvailable &&
+      (r.task || "text-generation") === task,
   );
   const trained = runs.filter(
-    (r) => r.action === "train" && r.status === "completed",
+    (r) =>
+      r.action === "train" &&
+      r.status === "completed" &&
+      (r.task || "text-generation") === task,
   );
   useEffect(() => {
     let live = true;
@@ -187,11 +211,15 @@ export default function LabView() {
       const id = await invoke<string>("lab_start", {
         config: {
           action,
+          task,
+          training_method: trainingMethod,
           backend:
             action === "evaluate"
               ? trained.find((r) => r.id === (training || trained[0]?.id))
                   ?.backend || backend
-              : backend,
+              : classification
+                ? "torch"
+                : backend,
           model_path: model,
           dataset: data,
           steps,
@@ -203,7 +231,7 @@ export default function LabView() {
           max_tokens: 64,
           python_path: python,
           run_id: training || trained[0]?.id || null,
-          resume_id: resume || null,
+          resume_id: classification ? null : resume || null,
           inspection_run_id: inspectionRun || null,
           prompt,
           lens_path: lens || null,
@@ -220,15 +248,19 @@ export default function LabView() {
       setStarting(false);
     }
   }
-  async function choose(kind: "model" | "dataset" | "lens" | "python") {
+  async function choose(
+    kind: "model" | "dataset" | "lens" | "python" | "images",
+  ) {
     try {
       const path = await open({
-        directory: kind === "model",
+        directory: kind === "model" || kind === "images",
         multiple: false,
         title: `Choose ${kind}`,
       });
       if (typeof path !== "string") return;
-      if (kind === "model") setModel(path);
+      if (kind === "images")
+        setData(await invoke<string>("lab_import_image_folder", { path }));
+      else if (kind === "model") setModel(path);
       else if (kind === "lens") setLens(path);
       else if (kind === "python") setPython(path);
       else setData(await invoke<string>("lab_read_dataset", { path }));
@@ -264,8 +296,8 @@ export default function LabView() {
           <span className="lab-eyebrow">MODEL LAB</span>
           <h1>Improve. Compare. Inspect.</h1>
           <p>
-            Train a separate adapter, test it on unseen examples, then explore
-            the model’s internal readouts.
+            Train task-specific models, compare held-out examples, then inspect
+            supported language-model readouts.
           </p>
         </div>
         <span className="lab-badge">Local · original weights preserved</span>
@@ -278,6 +310,12 @@ export default function LabView() {
         ].map(([value, label]) => (
           <button
             key={value}
+            disabled={value === "inspect" && classification}
+            title={
+              value === "inspect" && classification
+                ? "Inspection supports language decoders only"
+                : undefined
+            }
             aria-current={tab === value ? "page" : undefined}
             onClick={() => {
               setTab(value);
@@ -295,6 +333,36 @@ export default function LabView() {
       )}
       <div className="lab-layout">
         <section className="lab-card">
+          <label>
+            Training task
+            <select
+              value={task}
+              disabled={busy}
+              onChange={(e) => {
+                setTask(e.target.value);
+                setSelected("");
+                setDetail(null);
+                setError("");
+                setTraining("");
+                setResume("");
+                setTab("train");
+                setDraftReady(false);
+                if (e.target.value !== "text-generation") setBackend("torch");
+              }}
+            >
+              <option value="text-generation">Text generation · LoRA</option>
+              <option value="text-classification">Text classification</option>
+              <option value="image-classification">Image classification</option>
+              <option disabled>Speech recognition · not yet supported</option>
+              <option disabled>Embeddings · not yet supported</option>
+              <option disabled>Diffusion training · not yet supported</option>
+            </select>
+          </label>
+          <p className="lab-muted">
+            Train: selected task, compatible checkpoints only. Inspect: language
+            decoders only. Inference support does not guarantee training
+            support.
+          </p>
           <label>
             Prepared model
             <select
@@ -338,7 +406,9 @@ export default function LabView() {
               onChange={(e) => setBackend(e.target.value)}
               disabled={busy}
             >
-              <option value="mlx">MLX · Apple Silicon training</option>
+              <option value="mlx" disabled={classification}>
+                MLX · Apple Silicon training
+              </option>
               <option value="torch">
                 PyTorch · CPU / NVIDIA · training & inspection
               </option>
@@ -359,16 +429,37 @@ export default function LabView() {
             <>
               <h2>Training examples</h2>
               <p>
-                JSONL: prompt/completion pairs or chat messages ending in an
-                assistant answer. At least six distinct inputs.
+                {classification
+                  ? task === "text-classification"
+                    ? 'JSONL: {"text":"example","label":"class"}. At least six distinct examples per class.'
+                    : 'Import class folders or JSONL: {"image":"/absolute/path.png","label":"class"}. At least six images per class.'
+                  : "JSONL: prompt/completion pairs or chat messages ending in an assistant answer. At least six distinct inputs."}
               </p>
               <div className="lab-actions">
+                {task === "image-classification" && (
+                  <Button onClick={() => void choose("images")} disabled={busy}>
+                    Import class folders
+                  </Button>
+                )}
                 <Button onClick={() => void choose("dataset")} disabled={busy}>
                   Import JSONL
                 </Button>
                 <Button
-                  onClick={() => setData(sample)}
-                  disabled={busy || Boolean(data)}
+                  onClick={() =>
+                    setData(
+                      classification
+                        ? Array.from({ length: 12 }, (_, i) =>
+                            JSON.stringify({
+                              text: `${i < 6 ? "Positive" : "Negative"} review example ${i}`,
+                              label: i < 6 ? "positive" : "negative",
+                            }),
+                          ).join("\n")
+                        : sample,
+                    )
+                  }
+                  disabled={
+                    busy || Boolean(data) || task === "image-classification"
+                  }
                 >
                   Load toy example
                 </Button>
@@ -380,7 +471,11 @@ export default function LabView() {
                 onChange={(e) => setData(e.target.value)}
                 disabled={busy || !draftReady}
                 placeholder={
-                  '{"prompt":"Your question","completion":"Desired answer"}'
+                  task === "image-classification"
+                    ? '{"image":"/absolute/path.png","label":"class"}'
+                    : task === "text-classification"
+                      ? '{"text":"Example","label":"class"}'
+                      : '{"prompt":"Your question","completion":"Desired answer"}'
                 }
               />
               <div className="lab-fields">
@@ -395,31 +490,49 @@ export default function LabView() {
                     disabled={busy}
                   />
                 </label>
-                <label>
-                  Maximum tokens/example
-                  <input
-                    type="number"
-                    min={32}
-                    max={2048}
-                    value={length}
-                    onChange={(e) => setLength(Number(e.target.value))}
-                    disabled={busy}
-                  />
-                </label>
+                {task !== "image-classification" && (
+                  <label>
+                    Maximum tokens/example
+                    <input
+                      type="number"
+                      min={32}
+                      max={2048}
+                      value={length}
+                      onChange={(e) => setLength(Number(e.target.value))}
+                      disabled={busy}
+                    />
+                  </label>
+                )}
               </div>
               <details>
                 <summary>Training settings</summary>
-                <div className="lab-fields">
+                {classification && (
                   <label>
-                    Adapter rank
-                    <input
-                      type="number"
-                      min={1}
-                      max={64}
-                      value={rank}
-                      onChange={(e) => setRank(Number(e.target.value))}
-                    />
+                    Training method
+                    <select
+                      value={trainingMethod}
+                      onChange={(e) => setTrainingMethod(e.target.value)}
+                    >
+                      <option value="head">
+                        Train classification head only
+                      </option>
+                      <option value="full">Fine-tune full model</option>
+                    </select>
                   </label>
+                )}
+                <div className="lab-fields">
+                  {!classification && (
+                    <label>
+                      Adapter rank (language models only)
+                      <input
+                        type="number"
+                        min={1}
+                        max={64}
+                        value={rank}
+                        onChange={(e) => setRank(Number(e.target.value))}
+                      />
+                    </label>
+                  )}
                   <label>
                     Learning rate
                     <input
@@ -438,26 +551,30 @@ export default function LabView() {
                     />
                   </label>
                 </div>
-                <label>
-                  Continue from an adapter checkpoint
-                  <select
-                    value={resume}
-                    onChange={(e) => setResume(e.target.value)}
-                  >
-                    <option value="">Start fresh</option>
-                    {resumable
-                      .filter((r) => r.backend === backend)
-                      .map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {runLabel(r)}
-                        </option>
-                      ))}
-                  </select>
-                </label>
-                <p className="lab-muted">
-                  Continuation uses the latest readable checkpoint with a fresh
-                  optimizer. Keep the same dataset and seed.
-                </p>
+                {!classification && (
+                  <label>
+                    Continue from an adapter checkpoint
+                    <select
+                      value={resume}
+                      onChange={(e) => setResume(e.target.value)}
+                    >
+                      <option value="">Start fresh</option>
+                      {resumable
+                        .filter((r) => r.backend === backend)
+                        .map((r) => (
+                          <option key={r.id} value={r.id}>
+                            {runLabel(r)}
+                          </option>
+                        ))}
+                    </select>
+                  </label>
+                )}
+                {!classification && (
+                  <p className="lab-muted">
+                    Continuation uses the latest readable checkpoint with a
+                    fresh optimizer. Keep the same dataset and seed.
+                  </p>
+                )}
               </details>
               <div className="lab-actions">
                 <Button
@@ -471,23 +588,26 @@ export default function LabView() {
                   onClick={() => void start("train")}
                   disabled={busy || !model || !data}
                 >
-                  Train adapter
+                  {classification ? "Train classifier" : "Train adapter"}
                 </Button>
               </div>
               <p className="lab-muted">
                 Fixed split: about 80% training, 10% validation, 10% test.
-                Duplicate inputs are rejected. Training refuses overlong
-                examples rather than silently dropping answer tokens.
+                Duplicate inputs are rejected. Classification splits preserve
+                every class. Text examples are never silently truncated.
               </p>
             </>
           )}
           {tab === "compare" && (
             <>
-              <h2>Original vs adapter</h2>
+              <h2>
+                {classification
+                  ? "Before vs after training"
+                  : "Original vs adapter"}
+              </h2>
               <p>
-                Both models get the same untouched test examples and
-                deterministic decoding. Test data never enters training or
-                validation.
+                Both models get the same untouched test examples. Test data
+                never enters training or validation.
               </p>
               <label>
                 Completed training run
@@ -513,15 +633,21 @@ export default function LabView() {
                 Evaluate held-out examples
               </Button>
               <p className="lab-muted">
-                The run’s recorded model, adapter and backend are used. Exact
-                match is useful for constrained tasks; read the examples to
-                judge broader quality.
+                {classification
+                  ? "Compare accuracy, macro F1 and per-class errors. Baseline uses the same newly initialised head before training. Classification exports include the complete model, labels and preprocessing."
+                  : "The run’s recorded model, adapter and backend are used. Exact match is useful for constrained tasks; read the examples to judge broader quality."}
               </p>
             </>
           )}
           {tab === "inspect" && (
             <>
               <h2>Inside the model</h2>
+              {classification && (
+                <p role="status">
+                  Inspection is available only for supported language decoders.
+                  Classification models can be trained and evaluated here.
+                </p>
+              )}
               <p>
                 Read vocabulary associations at selected layers and token
                 positions. These are not thoughts, confidence estimates or proof
@@ -567,7 +693,9 @@ export default function LabView() {
               <Button
                 variant="primary"
                 onClick={() => void start("inspect")}
-                disabled={busy || !model || backend !== "torch"}
+                disabled={
+                  busy || !model || backend !== "torch" || classification
+                }
               >
                 Inspect prompt
               </Button>
@@ -722,11 +850,56 @@ export default function LabView() {
                     .map(([name, score]) => (
                       <div key={name}>
                         <strong>{(score * 100).toFixed(1)}%</strong>
-                        <span>{name} exact match</span>
+                        <span>
+                          {result.classification_metrics
+                            ? (name === "base"
+                                ? "Before training"
+                                : "Trained model") + " accuracy"
+                            : name + " exact match"}
+                        </span>
                       </div>
                     ))}
                 </div>
                 <p>{result.metric}</p>
+                {result.classification_metrics &&
+                  Object.entries(result.classification_metrics).map(
+                    ([name, m]) => (
+                      <section key={name}>
+                        <h3>
+                          {name === "base"
+                            ? "Before training"
+                            : "Trained model"}{" "}
+                          · Macro F1 {(m.macro_f1 * 100).toFixed(1)}%
+                        </h3>
+                        <div className="lens-grid">
+                          <table>
+                            <caption>
+                              Confusion matrix: rows = actual; columns =
+                              predicted
+                            </caption>
+                            <thead>
+                              <tr>
+                                <th>Actual / predicted</th>
+                                {m.labels.map((l) => (
+                                  <th key={l}>{l}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {m.confusion_matrix.map((row, i) => (
+                                <tr key={i}>
+                                  <th>{m.labels[i]}</th>
+                                  {row.map((v, j) => (
+                                    <td key={j}>{v}</td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </section>
+                    ),
+                  )}
                 {result.rows?.map((row, i) => (
                   <article key={i} className="lab-example">
                     <h3>Held-out example {i + 1}</h3>
@@ -744,7 +917,11 @@ export default function LabView() {
                         <pre>{row.base.text}</pre>
                       </div>
                       <div>
-                        <b>Adapter</b>
+                        <b>
+                          {result.classification_metrics
+                            ? "Trained model"
+                            : "Adapter"}
+                        </b>
                         <pre>{row.adapter.text}</pre>
                       </div>
                     </div>

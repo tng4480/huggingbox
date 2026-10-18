@@ -34,3 +34,13 @@ Click layer/token cells to view top-five vocabulary scores. They are not calibra
 - CUDA/Windows training and large-model memory behavior remain unverified. Start with a small model and short sequences; there is no dependable peak-memory predictor yet.
 
 Run the existing npm/Python/Rust checks. Build the desktop app with `npm run tauri build`. On this development machine use the isolated Rust environment shown in the local verification report.
+
+## Text and image classification
+
+Select the task in Lab. Classification uses PyTorch and compatible Transformers sequence/image classification architectures; it does not use the language-model LoRA recipe. Choose head-only training (frozen pretrained backbone) or full fine-tuning. Both initialise a fresh task head with your dataset's labels. The baseline is that same untrained head, saved before training. Original model files are never overwritten.
+
+Text JSONL: `{"text":"A useful example","label":"positive"}`. Image JSONL: `{"image":"/absolute/path/to/photo.png","label":"cat"}`. Alternatively import a folder containing one subfolder per image class. Image paths remain local; images must remain available and unchanged for evaluation. Exact duplicate images are rejected by file checksum; near-duplicates still require user curation. At least six distinct examples per class and two classes are required. Stratified deterministic train/validation/test splits include every class.
+
+Evaluation reports accuracy, macro F1, per-class precision/recall/F1, and a labelled confusion matrix. Full model weights, preprocessing and label mappings are exported under the run's `model/` folder. Classification continuation is not yet supported. J-lens inspection remains limited to supported language decoders. Speech, embedding and diffusion training are explicitly unavailable rather than routed into an incompatible trainer.
+
+Verification: text and image training, evaluation and exported-model reload ran on small synthetic BERT and ViT fixtures in both head-only and full-training modes. Tensor comparisons verified that head-only preserved the backbone and full training changed it. These are integration checks, not evidence of production model quality. Windows/CUDA classification training is unverified.
